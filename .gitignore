@@ -1,0 +1,60 @@
+# dependencies
+node_modules/
+
+# logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# coverage
+coverage/
+.nyc_output/
+
+# build output
+dist/
+build/
+out/
+
+# environment variables
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# package manager files (optional depending on team rules)
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# cache
+.cache/
+.tmp/
+
+# TypeScript
+*.tsbuildinfo
+
+# Next.js / Nuxt / Vite / similar frameworks
+.next/
+.nuxt/
+.vite/
+
+# testing
+jest-cache/
