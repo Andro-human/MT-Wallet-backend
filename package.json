@@ -2,14 +2,14 @@
   "name": "mtwallet-backend",
   "version": "1.0.0",
   "description": "MTWallet Backend - SMS parsing and categorization",
+  "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
     "lint": "eslint src/",
-    "typecheck": "tsc --noEmit",
-    "postinstall": "npm run build"
+    "typecheck": "tsc --noEmit"
   },
   "keywords": ["finance", "expense-tracker", "sms-parsing"],
   "author": "",
