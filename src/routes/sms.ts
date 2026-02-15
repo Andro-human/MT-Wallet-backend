@@ -6,6 +6,7 @@ import {
   getCategories,
   getCategoryIdBySlug,
   insertTransaction,
+  insertSyncRun,
 } from "../services/supabase.js";
 import { convertToINR, isForeignCurrency } from "../services/currency.js";
 import type { IngestResponse, ParsedTransactionResult } from "../types/index.js";
@@ -183,10 +184,43 @@ router.post("/ingest", async (req: Request, res: Response) => {
     }
   }
 
+  const completedAt = new Date();
   const duration = Date.now() - startTime;
   console.log(
     `[SMS Ingest] Completed in ${duration}ms - inserted: ${inserted}, skipped: ${skipped}, errors: ${errors}`
   );
+
+  // Determine run status
+  const runStatus = errors > 0 && inserted === 0
+    ? "failed"
+    : errors > 0
+    ? "partial"
+    : "success";
+
+  // Calculate ROWID range
+  const smsIds = messages.map((m) => m.id);
+  const rowidRange = smsIds.length > 0
+    ? { from: Math.min(...smsIds), to: Math.max(...smsIds) }
+    : undefined;
+
+  // Record sync run in database (fire-and-forget, don't block response)
+  const syncRunPromise = insertSyncRun({
+    userId: user.id,
+    startedAt: new Date(startTime),
+    completedAt,
+    durationMs: duration,
+    status: runStatus,
+    totalMessages: messages.length,
+    inserted,
+    skipped,
+    errors,
+    messages,
+    details,
+    source: "sms_sync",
+    rowidRange,
+  }).catch((err) => {
+    console.error("[SMS Ingest] Failed to record sync run:", err);
+  });
 
   const response: IngestResponse = {
     success: true,
@@ -194,10 +228,13 @@ router.post("/ingest", async (req: Request, res: Response) => {
     skipped,
     errors,
     total: messages.length,
-    details: process.env.NODE_ENV === "development" ? details : undefined,
+    details,
   };
 
   res.json(response);
+
+  // Await sync run insert after response is sent
+  await syncRunPromise;
 });
 
 /**

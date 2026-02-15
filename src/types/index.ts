@@ -28,6 +28,7 @@ export interface IngestResponse {
   errors: number;
   total: number;
   details?: ParsedTransactionResult[];
+  run_id?: string;
 }
 
 export interface ParsedTransactionResult {

@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { env } from "../config/env.js";
-import type { Category, User } from "../types/index.js";
+import type { Category, User, ParsedTransactionResult, SMSMessage } from "../types/index.js";
 import type { TransactionInsert } from "../schemas/transaction.js";
 
 // Create Supabase client with service role key (bypasses RLS)
@@ -108,4 +108,52 @@ export async function insertTransactions(
   }
 
   return { inserted, errors };
+}
+
+/**
+ * Insert a sync run record
+ */
+export async function insertSyncRun(params: {
+  userId: string;
+  startedAt: Date;
+  completedAt: Date;
+  durationMs: number;
+  status: "success" | "partial" | "failed" | "no_messages";
+  totalMessages: number;
+  inserted: number;
+  skipped: number;
+  errors: number;
+  messages: SMSMessage[];
+  details: ParsedTransactionResult[];
+  errorMessage?: string;
+  source?: string;
+  rowidRange?: { from: number; to: number };
+}): Promise<{ id: string | null; error?: string }> {
+  const { data, error } = await supabase
+    .from("sync_runs")
+    .insert({
+      user_id: params.userId,
+      started_at: params.startedAt.toISOString(),
+      completed_at: params.completedAt.toISOString(),
+      duration_ms: params.durationMs,
+      status: params.status,
+      total_messages: params.totalMessages,
+      inserted: params.inserted,
+      skipped: params.skipped,
+      errors: params.errors,
+      messages: params.messages,
+      details: params.details,
+      error_message: params.errorMessage || null,
+      source: params.source || "sms_sync",
+      rowid_range: params.rowidRange || null,
+    })
+    .select("id")
+    .single();
+
+  if (error) {
+    console.error("Failed to insert sync run:", error.message);
+    return { id: null, error: error.message };
+  }
+
+  return { id: data?.id || null };
 }
