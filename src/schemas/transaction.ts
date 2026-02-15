@@ -10,10 +10,6 @@ export const ParsedTransactionSchema = z.object({
   currency: z.string().optional(), // INR, USD, EUR, etc.
   direction: z.enum(["credit", "debit"]).optional(),
   merchant: z.string().nullable().optional(),
-  payment_method: z
-    .enum(["upi", "card", "neft", "imps", "netbanking", "wallet", "other"])
-    .nullable()
-    .optional(),
   account_last4: z.string().length(4).nullable().optional(),
   bank_name: z.string().nullable().optional(),
   reference_id: z.string().nullable().optional(),
@@ -52,7 +48,6 @@ export const TransactionInsertSchema = z.object({
   transacted_at: z.string().datetime(),
   merchant: z.string().nullable(),
   merchant_normalized: z.string().nullable(),
-  payment_method: z.string().nullable(),
   account_last4: z.string().nullable(),
   bank_name: z.string().nullable(),
   reference_id: z.string().nullable(),

@@ -23,36 +23,34 @@ function axioCategoryToSlug(axioCategory: string): string {
   return upper.toLowerCase().replace(/\s+/g, "-");
 }
 
-// ─── Parse Axio account string → payment_method, account_last4, bank_name ───
+// ─── Parse Axio account string → account_last4, bank_name ───
 function parseAccount(account: string): {
-  payment_method: string | null;
   account_last4: string | null;
   bank_name: string | null;
 } {
-  if (!account) return { payment_method: null, account_last4: null, bank_name: null };
+  if (!account) return { account_last4: null, bank_name: null };
 
   const acc = account.trim();
 
   // "CASH Spends"
   if (acc.toLowerCase().includes("cash")) {
-    return { payment_method: "other", account_last4: null, bank_name: null };
+    return { account_last4: null, bank_name: null };
   }
 
   // "Amazon Pay  Unknown"
   if (acc.toLowerCase().includes("amazon pay")) {
-    return { payment_method: "wallet", account_last4: null, bank_name: "Amazon Pay" };
+    return { account_last4: null, bank_name: "Amazon Pay" };
   }
 
   // "Simpl  Unknown"
   if (acc.toLowerCase().includes("simpl")) {
-    return { payment_method: "wallet", account_last4: null, bank_name: "Simpl" };
+    return { account_last4: null, bank_name: "Simpl" };
   }
 
   // "HDFC credit 5487", "ICICI credit 4007", "Axis credit 7307"
   const creditMatch = acc.match(/^(\w+)\s+credit\s+(\d{4})$/i);
   if (creditMatch) {
     return {
-      payment_method: "card",
       account_last4: creditMatch[2],
       bank_name: creditMatch[1] + " Bank",
     };
@@ -62,7 +60,6 @@ function parseAccount(account: string): {
   const debitMatch = acc.match(/^(\w+)\s+debit\s+(\d{4})$/i);
   if (debitMatch) {
     return {
-      payment_method: "card",
       account_last4: debitMatch[2],
       bank_name: debitMatch[1] + " Bank",
     };
@@ -72,13 +69,12 @@ function parseAccount(account: string): {
   const bankMatch = acc.match(/^(\w+)\s+(\d{4})$/);
   if (bankMatch) {
     return {
-      payment_method: "upi",
       account_last4: bankMatch[2],
       bank_name: bankMatch[1] + " Bank",
     };
   }
 
-  return { payment_method: null, account_last4: null, bank_name: null };
+  return { account_last4: null, bank_name: null };
 }
 
 // ─── Parse amount string (handles commas, negative, etc.) ───────────────────
@@ -179,7 +175,7 @@ router.post("/axio", async (req: Request, res: Response) => {
     }
 
     const direction = row.direction.trim().toUpperCase() === "CR" ? "credit" : "debit";
-    const { payment_method, account_last4, bank_name } = parseAccount(row.account);
+    const { account_last4, bank_name } = parseAccount(row.account);
 
     // Convert Axio category to our slug (keeping original categories)
     const slug = axioCategoryToSlug(row.category);
@@ -205,7 +201,6 @@ router.post("/axio", async (req: Request, res: Response) => {
       transacted_at,
       merchant: row.place.trim() || null,
       merchant_normalized: row.place.trim() || null,
-      payment_method,
       account_last4,
       bank_name,
       reference_id: null,

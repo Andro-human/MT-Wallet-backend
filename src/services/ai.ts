@@ -28,10 +28,6 @@ const TransactionOutputSchema = z.object({
     .string()
     .optional()
     .describe("Merchant or sender name, or UPI ID"),
-  payment_method: z
-    .enum(["upi", "card", "neft", "imps", "netbanking", "wallet", "other"])
-    .optional()
-    .describe("Payment method used"),
   account_last4: z
     .string()
     .optional()

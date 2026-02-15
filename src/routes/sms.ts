@@ -144,7 +144,6 @@ router.post("/ingest", async (req: Request, res: Response) => {
       transacted_at: msg.timestamp || new Date().toISOString(),
       merchant: txn.merchant || null,
       merchant_normalized: txn.merchant || null, // Could normalize later
-      payment_method: txn.payment_method || null,
       account_last4: txn.account_last4 || null,
       bank_name: txn.bank_name || null,
       reference_id: txn.reference_id || null,
