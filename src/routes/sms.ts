@@ -237,6 +237,248 @@ router.post("/ingest", async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/sms/shortcut-ingest
+ *
+ * Simplified endpoint for iOS Shortcuts automation.
+ * Expects API key in x-api-key header and simplified message format.
+ */
+router.post("/shortcut-ingest", async (req: Request, res: Response) => {
+  const startTime = Date.now();
+
+  // Extract API key from header
+  const apiKey = req.headers["x-api-key"] as string;
+  if (!apiKey) {
+    res.status(401).json({
+      success: false,
+      error: "Missing x-api-key header",
+    });
+    return;
+  }
+
+  // Validate API key and get user
+  const user = await getUserByApiKey(apiKey);
+  if (!user) {
+    res.status(401).json({
+      success: false,
+      error: "Invalid API key",
+    });
+    return;
+  }
+
+  // Validate request body structure
+  const { messages } = req.body;
+  if (!messages || !Array.isArray(messages) || messages.length === 0) {
+    res.status(400).json({
+      success: false,
+      error: "Missing or empty messages array",
+    });
+    return;
+  }
+
+  // Return success immediately to prevent Shortcut timeout
+  res.json({ success: true });
+
+  // Continue processing in background
+  (async () => {
+    try {
+      console.log(
+        `[Shortcut Ingest] User ${user.id.substring(0, 8)}... - ${messages.length} messages`
+      );
+
+      // Get categories for categorization
+      const categories = await getCategories(user.id);
+      if (categories.length === 0) {
+        console.warn("[Shortcut Ingest] No categories found, transactions will have null category");
+      }
+
+      // Transform iOS Shortcut format to internal format
+      const normalizedMessages = messages.map((msg: any, idx: number) => {
+        // Generate a unique numeric ID from timestamp or use index
+        let numericId: number;
+        if (msg.id) {
+          // Try to parse as timestamp or number
+          const parsed = parseInt(msg.id, 10);
+          numericId = isNaN(parsed) ? Date.now() + idx : parsed;
+        } else {
+          numericId = Date.now() + idx;
+        }
+
+        return {
+          id: numericId,
+          sender: msg.sender || "Unknown",
+          body: msg.body || "",
+          timestamp: new Date().toISOString(), // Use current time
+        };
+      });
+
+      // Parse and categorize with AI
+      let parsed;
+      try {
+        parsed = await parseAndCategorize(normalizedMessages, categories);
+      } catch (error) {
+        console.error("[Shortcut Ingest] AI parsing failed:", error);
+        return;
+      }
+
+      // Build a lookup map from sms_id → parsed result
+      const parsedMap = new Map(parsed.map((p) => [p.sms_id, p]));
+
+      // Process each parsed result
+      let inserted = 0;
+      let skipped = 0;
+      let errors = 0;
+      const details: ParsedTransactionResult[] = [];
+
+      for (const msg of normalizedMessages) {
+        const txn = parsedMap.get(msg.id);
+
+        // Handle case where AI didn't return result for this message
+        if (!txn) {
+          skipped++;
+          details.push({
+            sms_id: msg.id,
+            status: "skipped",
+            reason: "No AI result for this message",
+          });
+          continue;
+        }
+
+        // Skip non-transactions
+        if (!txn.is_transaction) {
+          skipped++;
+          details.push({
+            sms_id: msg.id,
+            status: "skipped",
+            reason: txn.skip_reason || "Not a transaction",
+          });
+          continue;
+        }
+
+        // Validate required fields for transactions
+        if (!txn.amount || !txn.direction) {
+          skipped++;
+          details.push({
+            sms_id: msg.id,
+            status: "skipped",
+            reason: "Missing amount or direction",
+          });
+          continue;
+        }
+
+        // Get category ID from slug
+        const categoryId = getCategoryIdBySlug(txn.category_slug, categories);
+
+        // Handle currency conversion
+        const currency = txn.currency || "INR";
+        let amountINR = txn.amount;
+        let originalAmount: number | null = null;
+        let originalCurrency: string | null = null;
+
+        if (isForeignCurrency(currency)) {
+          const conversion = await convertToINR(txn.amount, currency);
+          amountINR = conversion.amountINR;
+          originalAmount = txn.amount;
+          originalCurrency = currency.toUpperCase();
+          console.log(
+            `[Shortcut Ingest] Converted ${originalCurrency} ${originalAmount} → ₹${amountINR} (rate: ${conversion.rate})`
+          );
+        }
+
+        // Determine is_expense / is_income
+        const is_expense = txn.direction === "debit" ? (txn.is_expense ?? true) : false;
+        const is_income = txn.direction === "credit" ? (txn.is_income ?? true) : false;
+
+        // Prepare transaction for insert
+        const transactionData = {
+          user_id: user.id,
+          amount: amountINR,
+          direction: txn.direction,
+          transacted_at: msg.timestamp,
+          merchant: txn.merchant || null,
+          merchant_normalized: txn.merchant || null,
+          account_last4: txn.account_last4 || null,
+          bank_name: txn.bank_name || null,
+          reference_id: txn.reference_id || null,
+          raw_sms: msg.body,
+          sms_id: msg.id,
+          sms_sender: msg.sender,
+          source: "ios_shortcut" as const,
+          category_id: categoryId,
+          original_amount: originalAmount,
+          original_currency: originalCurrency,
+          is_expense,
+          is_income,
+        };
+
+        // Insert transaction
+        const result = await insertTransaction(transactionData);
+
+        if (result.success) {
+          inserted++;
+          details.push({
+            sms_id: msg.id,
+            status: "inserted",
+            transaction: {
+              amount: txn.amount,
+              direction: txn.direction,
+              merchant: txn.merchant || null,
+              category: txn.category_slug || null,
+            },
+          });
+        } else {
+          errors++;
+          details.push({
+            sms_id: msg.id,
+            status: "error",
+            reason: result.error || "Insert failed",
+          });
+        }
+      }
+
+      const completedAt = new Date();
+      const duration = Date.now() - startTime;
+      console.log(
+        `[Shortcut Ingest] Completed in ${duration}ms - inserted: ${inserted}, skipped: ${skipped}, errors: ${errors}`
+      );
+
+      // Determine run status
+      const runStatus = errors > 0 && inserted === 0
+        ? "failed"
+        : errors > 0
+        ? "partial"
+        : "success";
+
+      // Calculate ROWID range
+      const smsIds = normalizedMessages.map((m) => m.id);
+      const rowidRange = smsIds.length > 0
+        ? { from: Math.min(...smsIds), to: Math.max(...smsIds) }
+        : undefined;
+
+      // Record sync run in database
+      await insertSyncRun({
+        userId: user.id,
+        startedAt: new Date(startTime),
+        completedAt,
+        durationMs: duration,
+        status: runStatus,
+        totalMessages: normalizedMessages.length,
+        inserted,
+        skipped,
+        errors,
+        messages: normalizedMessages,
+        details,
+        source: "ios_shortcut",
+        rowidRange,
+      }).catch((err) => {
+        console.error("[Shortcut Ingest] Failed to record sync run:", err);
+      });
+    } catch (error) {
+      console.error("[Shortcut Ingest] Background processing error:", error);
+    }
+  })();
+});
+
+/**
  * GET /api/sms/health
  *
  * Health check endpoint

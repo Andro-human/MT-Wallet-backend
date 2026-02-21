@@ -54,7 +54,7 @@ export const TransactionInsertSchema = z.object({
   raw_sms: z.string(),
   sms_id: z.number(),
   sms_sender: z.string(),
-  source: z.literal("sms"),
+  source: z.enum(["sms", "ios_shortcut", "axio", "manual"]),
   category_id: z.string().uuid().nullable(),
   original_amount: z.number().positive().nullable(),
   original_currency: z.string().nullable(),
