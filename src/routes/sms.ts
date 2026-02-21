@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from "express";
+import crypto from "crypto";
 import { IngestRequestSchema } from "../schemas/transaction.js";
 import { parseAndCategorize } from "../services/ai.js";
 import {
@@ -193,8 +194,8 @@ router.post("/ingest", async (req: Request, res: Response) => {
   const runStatus = errors > 0 && inserted === 0
     ? "failed"
     : errors > 0
-    ? "partial"
-    : "success";
+      ? "partial"
+      : "success";
 
   // Calculate ROWID range
   const smsIds = messages.map((m) => m.id);
@@ -292,22 +293,24 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
       }
 
       // Transform iOS Shortcut format to internal format
-      const normalizedMessages = messages.map((msg: any, idx: number) => {
-        // Generate a unique numeric ID from timestamp or use index
-        let numericId: number;
-        if (msg.id) {
-          // Try to parse as timestamp or number
-          const parsed = parseInt(msg.id, 10);
-          numericId = isNaN(parsed) ? Date.now() + idx : parsed;
-        } else {
-          numericId = Date.now() + idx;
-        }
+      const normalizedMessages = messages.map((msg: any) => {
+        const senderStr = msg.sender || "Unknown";
+        const bodyStr = msg.body || "";
+
+        // Generate a deterministic numeric ID from sender + body hash to prevent duplicates
+        // We use the first 13 hex characters of SHA-256 (52 bits) to fit within JS MAX_SAFE_INTEGER
+        const hashHex = crypto
+          .createHash("sha256")
+          .update(`${senderStr}|${bodyStr}`)
+          .digest("hex")
+          .substring(0, 13);
+        const numericId = parseInt(hashHex, 16);
 
         return {
           id: numericId,
-          sender: msg.sender || "Unknown",
-          body: msg.body || "",
-          timestamp: new Date().toISOString(), // Use current time
+          sender: senderStr,
+          body: bodyStr,
+          timestamp: new Date().toISOString(), // Use current processing time
         };
       });
 
@@ -445,8 +448,8 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
       const runStatus = errors > 0 && inserted === 0
         ? "failed"
         : errors > 0
-        ? "partial"
-        : "success";
+          ? "partial"
+          : "success";
 
       // Calculate ROWID range
       const smsIds = normalizedMessages.map((m) => m.id);
