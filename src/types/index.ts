@@ -16,9 +16,14 @@ export interface User {
   email?: string;
 }
 
-export interface IngestRequest {
-  messages: SMSMessage[];
-  api_key: string;
+export interface UserMerchantMapping {
+  id: string;
+  user_id: string;
+  raw_merchant: string;
+  mapped_merchant: string;
+  default_category_id: string | null;
+  default_is_expense?: boolean | null;
+  default_is_income?: boolean | null;
 }
 
 export interface IngestResponse {

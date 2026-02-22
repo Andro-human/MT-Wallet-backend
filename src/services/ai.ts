@@ -41,14 +41,6 @@ const TransactionOutputSchema = z.object({
     .string()
     .optional()
     .describe("Category slug from the allowed list"),
-  is_expense: z
-    .boolean()
-    .optional()
-    .describe("True if this debit should count as an expense (not for self-transfers, investments, credit card payments, loan EMIs to own account)"),
-  is_income: z
-    .boolean()
-    .optional()
-    .describe("True if this credit should count as income (not for refunds, self-transfers, cashback, reversals)"),
   confidence: z
     .enum(["high", "medium", "low"])
     .optional()
@@ -70,72 +62,19 @@ export type ParsedTransaction = z.infer<typeof TransactionOutputSchema>;
  * Build the system prompt for SMS parsing
  */
 function buildSystemPrompt(categories: Category[]): string {
-  const categoryList = categories.map((c) => `- ${c.slug}: ${c.name}`).join("\n");
+  const categoryList = categories.map((c) => c.slug).join(", ");
 
-  return `You are a financial transaction parser for Indian banking SMS messages.
-
-TASK: Analyze each SMS and determine if it's a financial transaction. If yes, extract all details.
-
-RULES FOR IDENTIFYING TRANSACTIONS:
-1. Must involve actual money movement (spent, received, debited, credited)
-2. NOT transactions: OTPs, login alerts, balance checks, promotional offers, EMI conversions, failed/declined transactions
-
+  return `You are an AI parser for Indian banking SMS messages.
+TASK: Extract financial transaction data.
 RULES FOR PARSING:
-1. Amount is the TRANSACTION amount, NOT "Available Balance" or "Avl Limit"
-2. For foreign currency transactions (USD, EUR, GBP, etc.):
-   - Set "amount" to the exact foreign currency value (e.g., 5.90 for "USD 5.90")
-   - Set "currency" to the currency code (e.g., "USD")
-   - Example: "USD 5.90 spent" → amount: 5.90, currency: "USD"
-3. For INR transactions, set currency to "INR" (or omit it)
-4. "debited" or "spent" = debit (money out)
-5. "credited" or "received" = credit (money in)
-6. Extract UPI ID as merchant when available (e.g., "merchant@upi")
-7. Extract last 4 digits from "Card XX1234" or "ending 1234"
-
-AVAILABLE CATEGORIES (use slug):
-${categoryList}
-
-CATEGORY GUIDELINES:
-- food: restaurants, food delivery (Swiggy, Zomato), cafes, fast food
-- junk: junk food, fast food snacks, quick bites under ~200
-- groceries: BigBasket, Blinkit, Zepto, supermarkets
-- transport: Uber, Ola, Rapido, metro, parking
-- fuel: petrol, diesel, IOCL, HPCL, BPCL
-- shopping: Amazon, Flipkart, retail stores, online shopping
-- entertainment: Netflix, Spotify, movies, games, streaming
-- bills: phone recharge, electricity, rent
-- subscriptions: recurring subscriptions (Netflix, Spotify, etc.)
-- emi: EMI payments, loan installments
-- health: pharmacy, doctor, hospital, medical
-- travel: flights, hotels, IRCTC, travel booking
-- trip: trip-specific expenses
-- education: courses, books, school fees
-- salary: salary credited
-- income: other income, interest
-- credit: money received from others (not salary)
-- refund: refunds, cashback, reversals
-- transfer: self-transfers between own accounts
-- investment: mutual funds, stocks, FD, RD, SIP
-- bill-payment: credit card bill payment, loan payment
-- home-spend: rent, maintenance, home supplies
-- gifting: gifts given
-- celebration: birthday, anniversary, party expenses
-- lent: money lent to someone
-- charity: donations
-- cat: pet expenses
-- misc: miscellaneous
-- other: anything that doesn't fit above
-- unknown: can't determine category
-
-IS_EXPENSE / IS_INCOME RULES (IMPORTANT):
-- For DEBIT transactions, set is_expense:
-  - TRUE: actual spending (food, shopping, bills, transport, etc.)
-  - FALSE: self-transfers, investments, credit card bill payments, money lent, loan EMI payments to own account
-- For CREDIT transactions, set is_income:
-  - TRUE: salary, freelance income, interest earned, actual money received from others
-  - FALSE: refunds, cashback, self-transfers, reversals, credit card rewards
-
-OUTPUT: Return a JSON array with one object per input SMS, in the exact same order as input.`;
+1. Ignore OTPs, spam, and balance checks without actual money movement.
+2. Amount is the TRANSACTION amount, NOT "Available Balance" or "Avl Limit". Focus on words like "debited", "spent", "credited".
+3. For foreign currency (USD, EUR, etc.), set amount to the exact foreign value and currency to the code (e.g., "USD 5.90" -> 5.90, USD). Default to INR otherwise.
+4. "debited" or "spent" = debit (money out). "credited" or "received" = credit (money in).
+5. Extract precise merchant name, or extract UPI ID as merchant when available (e.g., "merchant@upi").
+6. Extract the last 4 digits of the card or account from patterns like "Card XX1234" or "ending 1234".
+7. category_slug: BEST fit from this valid list: [${categoryList}]. Use "other" if unsure.
+Return a JSON array exactly matching the output schema.`;
 }
 
 /**
@@ -157,7 +96,11 @@ export async function parseAndCategorize(
   }));
 
   const systemPrompt = buildSystemPrompt(categories);
-  const userPrompt = `Parse these ${messages.length} SMS messages:\n\n${JSON.stringify(messagesForPrompt, null, 2)}`;
+  const userPrompt = `INPUT MESSAGES:
+\`\`\`json
+${JSON.stringify(messagesForPrompt)}
+\`\`\`
+  `;
 
   try {
     const result = await generateObject({

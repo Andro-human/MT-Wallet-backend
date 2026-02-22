@@ -4,7 +4,7 @@ import { z } from "zod";
 export const ParsedTransactionSchema = z.object({
   sms_id: z.number(),
   is_transaction: z.boolean(),
-  
+
   // Only present if is_transaction is true
   amount: z.number().positive().optional(),
   currency: z.string().optional(), // INR, USD, EUR, etc.
@@ -15,7 +15,7 @@ export const ParsedTransactionSchema = z.object({
   reference_id: z.string().nullable().optional(),
   category_slug: z.string().nullable().optional(), // LLM picks from allowed categories
   confidence: z.enum(["high", "medium", "low"]).optional(),
-  
+
   // Only present if is_transaction is false
   skip_reason: z.string().optional(),
 });
@@ -58,6 +58,8 @@ export const TransactionInsertSchema = z.object({
   category_id: z.string().uuid().nullable(),
   original_amount: z.number().positive().nullable(),
   original_currency: z.string().nullable(),
+  is_expense: z.boolean().optional(),
+  is_income: z.boolean().optional(),
 });
 
 export type TransactionInsert = z.infer<typeof TransactionInsertSchema>;

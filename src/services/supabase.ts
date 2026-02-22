@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { env } from "../config/env.js";
-import type { Category, User, ParsedTransactionResult, SMSMessage } from "../types/index.js";
+import type { Category, User, ParsedTransactionResult, SMSMessage, UserMerchantMapping } from "../types/index.js";
 import type { TransactionInsert } from "../schemas/transaction.js";
 
 // Create Supabase client with service role key (bypasses RLS)
@@ -22,6 +22,23 @@ export async function getUserByApiKey(apiKey: string): Promise<User | null> {
   }
 
   return { id: data.user_id };
+}
+
+/**
+ * Get user merchant mappings
+ */
+export async function getUserMerchantMappings(userId: string): Promise<UserMerchantMapping[]> {
+  const { data, error } = await supabase
+    .from("user_merchant_mappings")
+    .select("id, user_id, raw_merchant, mapped_merchant, default_category_id, default_is_expense, default_is_income")
+    .eq("user_id", userId);
+
+  if (error) {
+    console.error("Failed to get merchant mappings:", error.message);
+    return [];
+  }
+
+  return data || [];
 }
 
 /**
@@ -88,26 +105,27 @@ export async function insertTransaction(
 }
 
 /**
- * Insert multiple transactions in batch
+ * Insert multiple transactions in a single bulk upsert call
  */
 export async function insertTransactions(
   transactions: TransactionInsert[]
 ): Promise<{ inserted: number; errors: number }> {
-  let inserted = 0;
-  let errors = 0;
-
-  // Insert one by one to handle individual errors
-  // Could optimize with batch insert if needed
-  for (const txn of transactions) {
-    const result = await insertTransaction(txn);
-    if (result.success) {
-      inserted++;
-    } else {
-      errors++;
-    }
+  if (transactions.length === 0) {
+    return { inserted: 0, errors: 0 };
   }
 
-  return { inserted, errors };
+  const { error } = await supabase.from("transactions").upsert(transactions, {
+    onConflict: "user_id,sms_id",
+    ignoreDuplicates: true,
+  });
+
+  if (error) {
+    console.error("Bulk insert failed:", error.message);
+    // If the entire batch fails, report all as errors
+    return { inserted: 0, errors: transactions.length };
+  }
+
+  return { inserted: transactions.length, errors: 0 };
 }
 
 /**

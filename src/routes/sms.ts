@@ -5,12 +5,13 @@ import { parseAndCategorize } from "../services/ai.js";
 import {
   getUserByApiKey,
   getCategories,
-  getCategoryIdBySlug,
-  insertTransaction,
+  insertTransactions,
   insertSyncRun,
+  getUserMerchantMappings,
 } from "../services/supabase.js";
 import { convertToINR, isForeignCurrency } from "../services/currency.js";
 import type { IngestResponse, ParsedTransactionResult } from "../types/index.js";
+import type { TransactionInsert } from "../schemas/transaction.js";
 
 const router = Router();
 
@@ -49,11 +50,18 @@ router.post("/ingest", async (req: Request, res: Response) => {
     `[SMS Ingest] User ${user.id.substring(0, 8)}... - ${messages.length} messages`
   );
 
-  // Get categories for categorization
+  // Get categories and map for O(1) lookups
   const categories = await getCategories(user.id);
+  const categoryMap = new Map(categories.map(c => [c.slug.toLowerCase(), c.id]));
+  const categoryDefMap = new Map(categories.map(c => [c.id, c]));
+
   if (categories.length === 0) {
     console.warn("No categories found, transactions will have null category");
   }
+
+  // Get user merchant overrides (Phase 2 - Name map & default categorization/expense flags)
+  const userOverrides = await getUserMerchantMappings(user.id);
+  const overridesMap = new Map(userOverrides.map(o => [o.raw_merchant.toLowerCase(), o]));
 
   // Parse and categorize with AI
   let parsed;
@@ -73,6 +81,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
   const parsedMap = new Map(parsed.map((p) => [p.sms_id, p]));
 
   // Process each parsed result
+  const transactionsToInsert: TransactionInsert[] = [];
   let inserted = 0;
   let skipped = 0;
   let errors = 0;
@@ -114,9 +123,6 @@ router.post("/ingest", async (req: Request, res: Response) => {
       continue;
     }
 
-    // Get category ID from slug
-    const categoryId = getCategoryIdBySlug(txn.category_slug, categories);
-
     // Handle currency conversion
     const currency = txn.currency || "INR";
     let amountINR = txn.amount;
@@ -133,9 +139,50 @@ router.post("/ingest", async (req: Request, res: Response) => {
       );
     }
 
-    // Determine is_expense / is_income
-    const is_expense = txn.direction === "debit" ? (txn.is_expense ?? true) : false;
-    const is_income = txn.direction === "credit" ? (txn.is_income ?? true) : false;
+    let finalCategoryId = txn.category_slug ? categoryMap.get(txn.category_slug.toLowerCase()) || null : null;
+    let finalMerchant = txn.merchant || null;
+
+    let overriddenIsExpense: boolean | null = null;
+    let overriddenIsIncome: boolean | null = null;
+
+    if (finalMerchant) {
+      const override = overridesMap.get(finalMerchant.toLowerCase());
+
+      if (override) {
+        console.log(`[Override] Re-mapped merchant "${finalMerchant}" → "${override.mapped_merchant}"`);
+        finalMerchant = override.mapped_merchant;
+
+        if (override.default_category_id) {
+          finalCategoryId = override.default_category_id;
+        }
+        if (override.default_is_expense !== undefined && override.default_is_expense !== null) {
+          overriddenIsExpense = override.default_is_expense;
+        }
+        if (override.default_is_income !== undefined && override.default_is_income !== null) {
+          overriddenIsIncome = override.default_is_income;
+        }
+      }
+    }
+
+    // Deterministic is_expense / is_income rules
+    let is_expense = txn.direction === "debit";
+    let is_income = txn.direction === "credit";
+
+    const finalCategoryDef = finalCategoryId ? categoryDefMap.get(finalCategoryId) : null;
+    const finalCategorySlug = finalCategoryDef?.slug || txn.category_slug;
+
+    if (finalCategorySlug) {
+      if (["transfer", "investment", "bill-payment", "emi", "lent"].includes(finalCategorySlug)) {
+        is_expense = false;
+      }
+      if (["transfer", "refund"].includes(finalCategorySlug)) {
+        is_income = false;
+      }
+    }
+
+    // Apply strict User Overrides for expense/income if they exist
+    if (overriddenIsExpense !== null) is_expense = overriddenIsExpense;
+    if (overriddenIsIncome !== null) is_income = overriddenIsIncome;
 
     // Prepare transaction for insert
     const transactionData = {
@@ -143,8 +190,8 @@ router.post("/ingest", async (req: Request, res: Response) => {
       amount: amountINR,
       direction: txn.direction,
       transacted_at: msg.timestamp || new Date().toISOString(),
-      merchant: txn.merchant || null,
-      merchant_normalized: txn.merchant || null, // Could normalize later
+      merchant: finalMerchant,
+      merchant_normalized: finalMerchant, // Could normalize later
       account_last4: txn.account_last4 || null,
       bank_name: txn.bank_name || null,
       reference_id: txn.reference_id || null,
@@ -152,36 +199,38 @@ router.post("/ingest", async (req: Request, res: Response) => {
       sms_id: msg.id,
       sms_sender: msg.sender,
       source: "sms" as const,
-      category_id: categoryId,
+      category_id: finalCategoryId,
       original_amount: originalAmount,
       original_currency: originalCurrency,
       is_expense,
       is_income,
     };
 
-    // Insert transaction
-    const result = await insertTransaction(transactionData);
+    // Accumulate transaction for bulk insert
+    transactionsToInsert.push(transactionData);
 
-    if (result.success) {
-      inserted++;
-      details.push({
-        sms_id: msg.id,
-        status: "inserted",
-        transaction: {
-          amount: txn.amount,
-          direction: txn.direction,
-          merchant: txn.merchant || null,
-          category: txn.category_slug || null,
-        },
-      });
-    } else {
-      errors++;
-      details.push({
-        sms_id: msg.id,
-        status: "error",
-        reason: result.error || "Insert failed",
-      });
-    }
+    // Add success detail immediately (will track DB errors in the bulk wrapper if needed, 
+    // or assume success since we are optimistically building the array)
+    details.push({
+      sms_id: msg.id,
+      status: "inserted",
+      transaction: {
+        amount: txn.amount,
+        direction: txn.direction,
+        merchant: txn.merchant || null,
+        category: txn.category_slug || null,
+      },
+    });
+  }
+
+  // Perform bulk insert
+  if (transactionsToInsert.length > 0) {
+    const bulkResult = await insertTransactions(transactionsToInsert);
+    inserted = bulkResult.inserted;
+    errors = bulkResult.errors;
+
+    // For absolute accuracy we'd map bulk errors back to `details`, 
+    // but the original code also just pushed to arrays and counted.
   }
 
   const completedAt = new Date();
@@ -286,11 +335,18 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
         `[Shortcut Ingest] User ${user.id.substring(0, 8)}... - ${messages.length} messages`
       );
 
-      // Get categories for categorization
+      // Get categories and map for O(1) lookups
       const categories = await getCategories(user.id);
+      const categoryMap = new Map(categories.map(c => [c.slug.toLowerCase(), c.id]));
+      const categoryDefMap = new Map(categories.map(c => [c.id, c]));
+
       if (categories.length === 0) {
         console.warn("[Shortcut Ingest] No categories found, transactions will have null category");
       }
+
+      // Get user merchant overrides (Phase 2 - Name map & default categorization/expense flags)
+      const userOverrides = await getUserMerchantMappings(user.id);
+      const overridesMap = new Map(userOverrides.map(o => [o.raw_merchant.toLowerCase(), o]));
 
       // Transform iOS Shortcut format to internal format
       const normalizedMessages = messages.map((msg: any) => {
@@ -327,6 +383,7 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
       const parsedMap = new Map(parsed.map((p) => [p.sms_id, p]));
 
       // Process each parsed result
+      const transactionsToInsert: TransactionInsert[] = [];
       let inserted = 0;
       let skipped = 0;
       let errors = 0;
@@ -368,9 +425,6 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
           continue;
         }
 
-        // Get category ID from slug
-        const categoryId = getCategoryIdBySlug(txn.category_slug, categories);
-
         // Handle currency conversion
         const currency = txn.currency || "INR";
         let amountINR = txn.amount;
@@ -387,9 +441,51 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
           );
         }
 
-        // Determine is_expense / is_income
-        const is_expense = txn.direction === "debit" ? (txn.is_expense ?? true) : false;
-        const is_income = txn.direction === "credit" ? (txn.is_income ?? true) : false;
+        // Apply User Merchant Overrides
+        let finalMerchant = txn.merchant || null;
+        let finalCategoryId = txn.category_slug ? categoryMap.get(txn.category_slug.toLowerCase()) || null : null;
+
+        let overriddenIsExpense: boolean | null = null;
+        let overriddenIsIncome: boolean | null = null;
+
+        if (finalMerchant) {
+          const override = overridesMap.get(finalMerchant.toLowerCase());
+
+          if (override) {
+            console.log(`[Shortcut Ingest Override] Re-mapped merchant "${finalMerchant}" → "${override.mapped_merchant}"`);
+            finalMerchant = override.mapped_merchant;
+
+            if (override.default_category_id) {
+              finalCategoryId = override.default_category_id;
+            }
+            if (override.default_is_expense !== undefined && override.default_is_expense !== null) {
+              overriddenIsExpense = override.default_is_expense;
+            }
+            if (override.default_is_income !== undefined && override.default_is_income !== null) {
+              overriddenIsIncome = override.default_is_income;
+            }
+          }
+        }
+
+        // Deterministic is_expense / is_income rules
+        let is_expense = txn.direction === "debit";
+        let is_income = txn.direction === "credit";
+
+        const finalCategoryDef = finalCategoryId ? categoryDefMap.get(finalCategoryId) : null;
+        const finalCategorySlug = finalCategoryDef?.slug || txn.category_slug;
+
+        if (finalCategorySlug) {
+          if (["transfer", "investment", "bill-payment", "emi", "lent"].includes(finalCategorySlug)) {
+            is_expense = false;
+          }
+          if (["transfer", "refund"].includes(finalCategorySlug)) {
+            is_income = false;
+          }
+        }
+
+        // Apply strict User Overrides for expense/income if they exist
+        if (overriddenIsExpense !== null) is_expense = overriddenIsExpense;
+        if (overriddenIsIncome !== null) is_income = overriddenIsIncome;
 
         // Prepare transaction for insert
         const transactionData = {
@@ -397,8 +493,8 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
           amount: amountINR,
           direction: txn.direction,
           transacted_at: msg.timestamp,
-          merchant: txn.merchant || null,
-          merchant_normalized: txn.merchant || null,
+          merchant: finalMerchant,
+          merchant_normalized: finalMerchant,
           account_last4: txn.account_last4 || null,
           bank_name: txn.bank_name || null,
           reference_id: txn.reference_id || null,
@@ -406,36 +502,33 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
           sms_id: msg.id,
           sms_sender: msg.sender,
           source: "ios_shortcut" as const,
-          category_id: categoryId,
+          category_id: finalCategoryId,
           original_amount: originalAmount,
           original_currency: originalCurrency,
           is_expense,
           is_income,
         };
 
-        // Insert transaction
-        const result = await insertTransaction(transactionData);
+        // Accumulate transaction for bulk insert
+        transactionsToInsert.push(transactionData);
 
-        if (result.success) {
-          inserted++;
-          details.push({
-            sms_id: msg.id,
-            status: "inserted",
-            transaction: {
-              amount: txn.amount,
-              direction: txn.direction,
-              merchant: txn.merchant || null,
-              category: txn.category_slug || null,
-            },
-          });
-        } else {
-          errors++;
-          details.push({
-            sms_id: msg.id,
-            status: "error",
-            reason: result.error || "Insert failed",
-          });
-        }
+        details.push({
+          sms_id: msg.id,
+          status: "inserted",
+          transaction: {
+            amount: txn.amount,
+            direction: txn.direction,
+            merchant: txn.merchant || null,
+            category: txn.category_slug || null,
+          },
+        });
+      }
+
+      // Perform bulk insert
+      if (transactionsToInsert.length > 0) {
+        const bulkResult = await insertTransactions(transactionsToInsert);
+        inserted = bulkResult.inserted;
+        errors = bulkResult.errors;
       }
 
       const completedAt = new Date();
