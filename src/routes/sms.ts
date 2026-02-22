@@ -366,7 +366,7 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
           id: numericId,
           sender: senderStr,
           body: bodyStr,
-          timestamp: new Date().toISOString(), // Use current processing time
+          timestamp: msg.timestamp || new Date().toISOString()
         };
       });
 
