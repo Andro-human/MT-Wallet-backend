@@ -27,6 +27,7 @@ async function triggerPushNotification(syncRun: {
   skipped: number;
   errors: number;
   total_messages: number;
+  transactions?: { amount: number; direction: string; merchant: string | null }[];
 }) {
   if (!syncRun.inserted || syncRun.inserted === 0) return;
 
@@ -337,6 +338,9 @@ router.post("/ingest", async (req: Request, res: Response) => {
     skipped,
     errors,
     total_messages: messages.length,
+    transactions: details
+      .filter(d => d.status === "inserted" && d.transaction)
+      .map(d => ({ amount: d.transaction!.amount, direction: d.transaction!.direction, merchant: d.transaction!.merchant })),
   });
 });
 
@@ -631,6 +635,9 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
         skipped,
         errors,
         total_messages: normalizedMessages.length,
+        transactions: details
+          .filter(d => d.status === "inserted" && d.transaction)
+          .map(d => ({ amount: d.transaction!.amount, direction: d.transaction!.direction, merchant: d.transaction!.merchant })),
       });
     } catch (error) {
       console.error("[Shortcut Ingest] Background processing error:", error);
