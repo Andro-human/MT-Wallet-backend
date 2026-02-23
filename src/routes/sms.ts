@@ -12,8 +12,52 @@ import {
 import { convertToINR, isForeignCurrency } from "../services/currency.js";
 import type { IngestResponse, ParsedTransactionResult } from "../types/index.js";
 import type { TransactionInsert } from "../schemas/transaction.js";
+import { env } from "../config/env.js";
 
 const router = Router();
+
+/**
+ * Trigger push notification via Supabase Edge Function
+ */
+async function triggerPushNotification(syncRun: {
+  id?: string;
+  user_id: string;
+  status: string;
+  inserted: number;
+  skipped: number;
+  errors: number;
+  total_messages: number;
+}) {
+  if (!syncRun.inserted || syncRun.inserted === 0) return;
+
+  try {
+    const response = await fetch(
+      `${env.supabaseUrl}/functions/v1/send-push-notification`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${env.supabaseServiceRoleKey}`,
+        },
+        body: JSON.stringify({
+          type: "INSERT",
+          table: "sync_runs",
+          record: syncRun,
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      console.error(`[Push] Edge Function returned ${response.status}: ${text}`);
+    } else {
+      const result = await response.json().catch(() => null);
+      console.log(`[Push] Notification triggered:`, result);
+    }
+  } catch (err) {
+    console.error("[Push] Failed to trigger notification:", err);
+  }
+}
 
 /**
  * POST /api/sms/ingest
@@ -284,6 +328,16 @@ router.post("/ingest", async (req: Request, res: Response) => {
 
   // Await sync run insert after response is sent
   await syncRunPromise;
+
+  // Trigger push notification directly (bypass broken DB webhook)
+  triggerPushNotification({
+    user_id: user.id,
+    status: runStatus,
+    inserted,
+    skipped,
+    errors,
+    total_messages: messages.length,
+  });
 });
 
 /**
@@ -567,6 +621,16 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
         rowidRange,
       }).catch((err) => {
         console.error("[Shortcut Ingest] Failed to record sync run:", err);
+      });
+
+      // Trigger push notification directly (bypass broken DB webhook)
+      triggerPushNotification({
+        user_id: user.id,
+        status: runStatus,
+        inserted,
+        skipped,
+        errors,
+        total_messages: normalizedMessages.length,
       });
     } catch (error) {
       console.error("[Shortcut Ingest] Background processing error:", error);
