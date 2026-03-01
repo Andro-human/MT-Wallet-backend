@@ -217,10 +217,10 @@ router.post("/ingest", async (req: Request, res: Response) => {
     const finalCategorySlug = finalCategoryDef?.slug || txn.category_slug;
 
     if (finalCategorySlug) {
-      if (["transfer", "investment", "bill-payment", "emi", "lent"].includes(finalCategorySlug)) {
+      if (["investment", "self-transfer"].includes(finalCategorySlug)) {
         is_expense = false;
       }
-      if (["transfer", "refund"].includes(finalCategorySlug)) {
+      if (["self-transfer"].includes(finalCategorySlug)) {
         is_income = false;
       }
     }
@@ -352,6 +352,13 @@ router.post("/ingest", async (req: Request, res: Response) => {
  */
 router.post("/shortcut-ingest", async (req: Request, res: Response) => {
   const startTime = Date.now();
+
+  // DEBUG LOGGING
+  console.log("\n==================================");
+  console.log("[Shortcut Ingest] INCOMING PAYLOAD");
+  console.log("[Shortcut Ingest] Headers:", JSON.stringify(req.headers, null, 2));
+  console.log("[Shortcut Ingest] Body:", JSON.stringify(req.body, null, 2));
+  console.log("==================================\n");
 
   // Extract API key from header
   const apiKey = req.headers["x-api-key"] as string;
@@ -533,10 +540,10 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
         const finalCategorySlug = finalCategoryDef?.slug || txn.category_slug;
 
         if (finalCategorySlug) {
-          if (["transfer", "investment", "bill-payment", "emi", "lent"].includes(finalCategorySlug)) {
+          if (["investment", "self-transfer"].includes(finalCategorySlug)) {
             is_expense = false;
           }
-          if (["transfer", "refund"].includes(finalCategorySlug)) {
+          if (["self-transfer"].includes(finalCategorySlug)) {
             is_income = false;
           }
         }
