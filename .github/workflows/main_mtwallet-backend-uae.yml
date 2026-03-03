@@ -68,4 +68,3 @@ jobs:
           slot-name: 'Production'
           package: deploy.zip
           startup-command: 'node dist/index.js'
-          
