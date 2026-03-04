@@ -418,11 +418,13 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
         const senderStr = msg.sender || "Unknown";
         const bodyStr = msg.body || "";
 
-        // Generate a deterministic numeric ID from sender + body hash to prevent duplicates
+        const timestampStr = msg.timestamp || "";
+
+        // Generate a deterministic numeric ID from sender + body + timestamp hash to prevent duplicates
         // We use the first 13 hex characters of SHA-256 (52 bits) to fit within JS MAX_SAFE_INTEGER
         const hashHex = crypto
           .createHash("sha256")
-          .update(`${senderStr}|${bodyStr}`)
+          .update(`${senderStr}|${bodyStr}|${timestampStr}`)
           .digest("hex")
           .substring(0, 13);
         const numericId = parseInt(hashHex, 16);
