@@ -1,12 +1,13 @@
 # MTWallet Backend
 
-Backend API for MTWallet expense tracker. Handles SMS parsing and categorization using AI.
+Backend API API for the MTWallet expense tracker. This server is the critical junction between your raw bank SMS and the AI-driven categorization engine that powers your dashboard.
 
-## Features
+## Core Features
 
-- **SMS Ingestion** - Receives raw SMS, parses with Gemini AI, categorizes transactions
-- **Smart Categorization** - AI picks categories based on merchant, amount, and context
-- **Supabase Integration** - Direct database operations with service role
+- **SMS Ingestion Endpoint** - Optimized to securely accept batched SMS packets directly from an iOS Shortcut worker node.
+- **Deterministic AI Extraction** - Processes raw SMS text securely via a highly-compressed, deterministic prompt to Gemini to extract amount, merchant, direction (expense/income), and categorized tags with minimal hallucinations.
+- **Deduplication Engine Layer** - Automatically mitigates dual-SIM or repeated SMS blasts using a time-sensitive SHA-256 hash logic before storing into Supabase.
+- **Push Notification Integration** - Employs encrypted VAPID keys and Web Push protocols to instantly alert your configured devices the split second a new transaction is recorded.
 
 ## Setup
 
@@ -18,12 +19,15 @@ npm install
 
 ### 2. Configure environment
 
-Create a `.env` file:
+Create a `.env` file referencing your external services:
 
 ```bash
 # Server
 PORT=3001
 NODE_ENV=development
+
+# Authentication API Key (Required for iOS Shortcut requests)
+API_KEY=your-secure-ingest-key
 
 # Supabase
 SUPABASE_URL=https://your-project.supabase.co
@@ -31,6 +35,10 @@ SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 
 # Google AI (Gemini)
 GOOGLE_GENERATIVE_AI_API_KEY=your-gemini-api-key
+
+# Push Notifications (Web Push)
+VAPID_PUBLIC_KEY=your-vapid-public-key
+VAPID_PRIVATE_KEY=your-vapid-private-key
 ```
 
 ### 3. Run development server
@@ -39,87 +47,29 @@ GOOGLE_GENERATIVE_AI_API_KEY=your-gemini-api-key
 npm run dev
 ```
 
-### 4. Test the endpoint
-
-```bash
-curl -X POST http://localhost:3001/api/sms/ingest \
-  -H "Content-Type: application/json" \
-  -d '{
-    "api_key": "your-mtwallet-api-key",
-    "messages": [
-      {
-        "id": 1,
-        "sender": "VM-HDFCBK",
-        "body": "Rs.234 spent on HDFC Card ending 5487 at SWIGGY on 2026-01-29",
-        "timestamp": "2026-01-29T12:00:00Z"
-      }
-    ]
-  }'
-```
-
-## API Endpoints
-
-### POST /api/sms/ingest
-
-Ingest SMS messages for parsing and categorization.
-
-**Request:**
-```json
-{
-  "api_key": "user-api-key-from-app",
-  "messages": [
-    {
-      "id": 123,
-      "sender": "VM-HDFCBK",
-      "body": "SMS content...",
-      "timestamp": "2026-01-29T12:00:00Z"
-    }
-  ]
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "inserted": 5,
-  "skipped": 10,
-  "errors": 0,
-  "total": 15
-}
-```
-
-### GET /api/sms/health
-
-Health check endpoint.
-
 ## Architecture
 
+The ingestion pipeline is designed for absolute reliability:
 ```
-sms_sync.py (Mac) → Backend API → Gemini AI → Supabase
+iOS Shortcut (Worker) → Backend API → Gemini AI → Supabase DB → Push Notification Event
 ```
 
-1. `sms_sync.py` reads SMS from macOS Messages database
-2. POSTs raw SMS to `/api/sms/ingest`
-3. Backend sends to Gemini for parsing + categorization
-4. Valid transactions inserted to Supabase
-5. Frontend reads directly from Supabase
+1. **iOS Background Automation** intercepts SMS, batches them, and fires them to `/api/sms/ingest`.
+2. Backend receives the array, validates the `API_KEY`, and computes SHA-256 deduplication hashes.
+3. Backend sends distinct SMS bodies to Gemini for optimized parsing + categorization.
+4. Valid, unique transactions are inserted into Supabase using the Service Role bypass.
+5. VAPID Web Push triggers an asynchronous notification to subscribed devices.
 
 ## Deployment
 
-### Azure App Service
+This backend is a standard Node.js Express application, which means you can deploy it anywhere that supports Node environments (Vercel, Render, AWS, Azure, DigitalOcean, your own VPS, etc.).
 
 ```bash
-# Build
+# Build the TypeScript dist
 npm run build
 
-# Deploy (configure Azure CLI first)
-az webapp up --name mtwallet-backend --runtime "NODE:20-lts"
+# Start the Node process
+npm start
 ```
 
-### Environment Variables (Azure)
-
-Set in Azure Portal → App Service → Configuration → Application settings:
-- `SUPABASE_URL`
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `GOOGLE_GENERATIVE_AI_API_KEY`
+**Important:** Regardless of where you deploy, ensure that you securely map all 7 Environment Variables (from your `.env` file) into your cloud provider's configuration settings.
