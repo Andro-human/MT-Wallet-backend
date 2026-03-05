@@ -22,8 +22,13 @@ export interface UserMerchantMapping {
   raw_merchant: string;
   mapped_merchant: string;
   default_category_id: string | null;
-  default_is_expense?: boolean | null;
-  default_is_income?: boolean | null;
+  default_is_expense: boolean | null;
+  default_is_income: boolean | null;
+  amount_operator: '<' | '>' | '<=' | '>=' | '=' | null;
+  amount_threshold: number | null;
+  date_operator: '<' | '>' | '<=' | '>=' | '=' | null;
+  date_threshold: number | null;
+  match_type: 'exact' | 'contains';
 }
 
 export interface IngestResponse {

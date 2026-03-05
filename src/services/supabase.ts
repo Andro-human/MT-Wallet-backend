@@ -30,7 +30,7 @@ export async function getUserByApiKey(apiKey: string): Promise<User | null> {
 export async function getUserMerchantMappings(userId: string): Promise<UserMerchantMapping[]> {
   const { data, error } = await supabase
     .from("user_merchant_mappings")
-    .select("id, user_id, raw_merchant, mapped_merchant, default_category_id, default_is_expense, default_is_income")
+    .select("id, user_id, raw_merchant, mapped_merchant, default_category_id, default_is_expense, default_is_income, amount_operator, amount_threshold, date_operator, date_threshold, match_type")
     .eq("user_id", userId);
 
   if (error) {

@@ -411,7 +411,58 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
 
       // Get user merchant overrides (Phase 2 - Name map & default categorization/expense flags)
       const userOverrides = await getUserMerchantMappings(user.id);
-      const overridesMap = new Map(userOverrides.map(o => [o.raw_merchant.toLowerCase(), o]));
+      
+      // Group overrides by raw_merchant
+      const overridesMap = new Map<string, typeof userOverrides>();
+      for (const override of userOverrides) {
+        const key = override.raw_merchant.toLowerCase();
+        if (!overridesMap.has(key)) overridesMap.set(key, []);
+        overridesMap.get(key)!.push(override);
+      }
+
+      // Helper to evaluate if a rule matches
+      const evaluateRule = (rule: typeof userOverrides[0], amount: number, currentMerchant: string, transactedAt: string) => {
+        // 1. Check merchant name match based on match_type
+        const ruleVal = rule.raw_merchant.toLowerCase();
+        const currentVal = currentMerchant.toLowerCase();
+        
+        let isNameMatch = false;
+        if (rule.match_type === 'contains') {
+          isNameMatch = currentVal.includes(ruleVal);
+        } else {
+          isNameMatch = currentVal === ruleVal;
+        }
+        
+        if (!isNameMatch) return false;
+
+        // 2. Check amount conditions if specified
+        if (rule.amount_operator && rule.amount_threshold !== null) {
+          switch (rule.amount_operator) {
+            case '<': if (!(amount < rule.amount_threshold)) return false; break;
+            case '<=': if (!(amount <= rule.amount_threshold)) return false; break;
+            case '>': if (!(amount > rule.amount_threshold)) return false; break;
+            case '>=': if (!(amount >= rule.amount_threshold)) return false; break;
+            case '=': if (!(amount === rule.amount_threshold)) return false; break;
+          }
+        }
+
+        // 3. Check date conditions if specified
+        if (rule.date_operator && rule.date_threshold !== null && transactedAt) {
+          const txDate = new Date(transactedAt);
+          const dayOfMonth = txDate.getDate(); // 1-31
+          
+          switch (rule.date_operator) {
+            case '<': if (!(dayOfMonth < rule.date_threshold)) return false; break;
+            case '<=': if (!(dayOfMonth <= rule.date_threshold)) return false; break;
+            case '>': if (!(dayOfMonth > rule.date_threshold)) return false; break;
+            case '>=': if (!(dayOfMonth >= rule.date_threshold)) return false; break;
+            case '=': if (!(dayOfMonth === rule.date_threshold)) return false; break;
+          }
+        }
+        
+        // Passed all specified conditions
+        return true;
+      };
 
       // Transform iOS Shortcut format to internal format
       const normalizedMessages = messages.map((msg: any) => {
@@ -516,20 +567,29 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
         let overriddenIsIncome: boolean | null = null;
 
         if (finalMerchant) {
-          const override = overridesMap.get(finalMerchant.toLowerCase());
-
-          if (override) {
-            console.log(`[Shortcut Ingest Override] Re-mapped merchant "${finalMerchant}" → "${override.mapped_merchant}"`);
-            finalMerchant = override.mapped_merchant;
-
-            if (override.default_category_id) {
-              finalCategoryId = override.default_category_id;
+          // Find all rules that could match this merchant exact or contains
+          // Iterate over all overrides (or optimize if you want, but user rules are usually < 100)
+          let matchedRule: typeof userOverrides[0] | null = null;
+          
+          for (const rule of userOverrides) {
+            if (evaluateRule(rule, amountINR, finalMerchant, msg.timestamp)) {
+               matchedRule = rule;
+               break; // Stop at first matched rule
             }
-            if (override.default_is_expense !== undefined && override.default_is_expense !== null) {
-              overriddenIsExpense = override.default_is_expense;
+          }
+
+          if (matchedRule) {
+            console.log(`[Shortcut Ingest Override] Re-mapped merchant "${finalMerchant}" → "${matchedRule.mapped_merchant}"`);
+            finalMerchant = matchedRule.mapped_merchant;
+
+            if (matchedRule.default_category_id) {
+              finalCategoryId = matchedRule.default_category_id;
             }
-            if (override.default_is_income !== undefined && override.default_is_income !== null) {
-              overriddenIsIncome = override.default_is_income;
+            if (matchedRule.default_is_expense !== undefined && matchedRule.default_is_expense !== null) {
+              overriddenIsExpense = matchedRule.default_is_expense;
+            }
+            if (matchedRule.default_is_income !== undefined && matchedRule.default_is_income !== null) {
+              overriddenIsIncome = matchedRule.default_is_income;
             }
           }
         }
