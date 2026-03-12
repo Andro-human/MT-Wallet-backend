@@ -14,6 +14,7 @@ export interface Category {
 export interface User {
   id: string;
   email?: string;
+  enable_review_mode?: boolean;
 }
 
 export interface UserMerchantMapping {

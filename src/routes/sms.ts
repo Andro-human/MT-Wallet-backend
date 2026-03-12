@@ -249,6 +249,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
       original_currency: originalCurrency,
       is_expense,
       is_income,
+      needs_review: user.enable_review_mode ?? true,
     };
 
     // Accumulate transaction for bulk insert
@@ -634,6 +635,7 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
           original_currency: originalCurrency,
           is_expense,
           is_income,
+          needs_review: user.enable_review_mode ?? true,
         };
 
         // Accumulate transaction for bulk insert

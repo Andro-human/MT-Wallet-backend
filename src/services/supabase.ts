@@ -12,7 +12,7 @@ export const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey
 export async function getUserByApiKey(apiKey: string): Promise<User | null> {
   const { data, error } = await supabase
     .from("profiles")
-    .select("user_id")
+    .select("user_id, enable_review_mode")
     .eq("api_key", apiKey)
     .single();
 
@@ -21,7 +21,10 @@ export async function getUserByApiKey(apiKey: string): Promise<User | null> {
     return null;
   }
 
-  return { id: data.user_id };
+  return { 
+    id: data.user_id,
+    enable_review_mode: data.enable_review_mode,
+  };
 }
 
 /**

@@ -60,6 +60,7 @@ export const TransactionInsertSchema = z.object({
   original_currency: z.string().nullable(),
   is_expense: z.boolean().optional(),
   is_income: z.boolean().optional(),
+  needs_review: z.boolean().optional(),
 });
 
 export type TransactionInsert = z.infer<typeof TransactionInsertSchema>;
