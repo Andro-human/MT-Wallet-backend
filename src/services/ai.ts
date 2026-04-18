@@ -58,6 +58,55 @@ const TransactionsArraySchema = z.array(TransactionOutputSchema);
 
 export type ParsedTransaction = z.infer<typeof TransactionOutputSchema>;
 
+const PRIMARY_MODEL = "gemini-2.5-flash";
+const FALLBACK_MODEL = "gemini-2.5-pro";
+const MAX_ATTEMPTS = 3;
+const BASE_DELAY_MS = 500;
+const MAX_DELAY_MS = 8000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function callModelWithRetry(
+  modelId: string,
+  systemPrompt: string,
+  userPrompt: string
+): Promise<ParsedTransaction[]> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const result = await generateObject({
+        model: google(modelId),
+        schema: TransactionsArraySchema,
+        system: systemPrompt,
+        prompt: userPrompt,
+        temperature: 0,
+        maxRetries: 0, // retries handled here so we control backoff + logging
+      });
+      if (attempt > 1) {
+        console.log(`[ai] ${modelId} succeeded on attempt ${attempt}/${MAX_ATTEMPTS}`);
+      }
+      return result.object;
+    } catch (error) {
+      lastError = error;
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[ai] ${modelId} attempt ${attempt}/${MAX_ATTEMPTS} failed: ${message}`
+      );
+      if (attempt < MAX_ATTEMPTS) {
+        const expDelay = BASE_DELAY_MS * 2 ** (attempt - 1);
+        const jitter = Math.random() * 250;
+        const delay = Math.min(expDelay + jitter, MAX_DELAY_MS);
+        await sleep(delay);
+      }
+    }
+  }
+
+  throw lastError;
+}
+
 /**
  * Build the system prompt for SMS parsing
  */
@@ -103,17 +152,24 @@ ${JSON.stringify(messagesForPrompt)}
   `;
 
   try {
-    const result = await generateObject({
-      model: google("gemini-2.5-flash"),
-      schema: TransactionsArraySchema,
-      system: systemPrompt,
-      prompt: userPrompt,
-      temperature: 0, // Deterministic output
-    });
-
-    return result.object;
-  } catch (error) {
-    console.error("AI parsing error:", error);
-    throw new Error(`Failed to parse SMS with AI: ${error}`);
+    return await callModelWithRetry(PRIMARY_MODEL, systemPrompt, userPrompt);
+  } catch (primaryError) {
+    const primaryMessage =
+      primaryError instanceof Error ? primaryError.message : String(primaryError);
+    console.warn(
+      `[ai] ${PRIMARY_MODEL} exhausted ${MAX_ATTEMPTS} attempts (${primaryMessage}); falling back to ${FALLBACK_MODEL}`
+    );
+    try {
+      return await callModelWithRetry(FALLBACK_MODEL, systemPrompt, userPrompt);
+    } catch (fallbackError) {
+      console.error("[ai] Both primary and fallback models failed", {
+        primaryError: primaryMessage,
+        fallbackError:
+          fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+      });
+      throw new Error(
+        `Failed to parse SMS with AI after retries on ${PRIMARY_MODEL} and ${FALLBACK_MODEL}: ${fallbackError}`
+      );
+    }
   }
 }
