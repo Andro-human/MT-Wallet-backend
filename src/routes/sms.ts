@@ -10,11 +10,55 @@ import {
   getUserMerchantMappings,
 } from "../services/supabase.js";
 import { convertToINR, isForeignCurrency } from "../services/currency.js";
-import type { IngestResponse, ParsedTransactionResult } from "../types/index.js";
+import type { IngestResponse, ParsedTransactionResult, SMSMessage } from "../types/index.js";
 import type { TransactionInsert } from "../schemas/transaction.js";
 import { env } from "../config/env.js";
 
 const router = Router();
+
+/**
+ * Record a failed sync run for any post-auth failure. Always awaits so the row
+ * lands before the handler returns, and never throws (catches its own errors).
+ */
+async function recordFailedSyncRun(params: {
+  userId: string;
+  startTime: number;
+  messages: SMSMessage[];
+  source: string;
+  error: unknown;
+  logPrefix: string;
+}): Promise<string> {
+  const errorMessage =
+    params.error instanceof Error ? params.error.message : String(params.error);
+  const smsIds = params.messages.map((m) => m.id);
+  const rowidRange =
+    smsIds.length > 0
+      ? { from: Math.min(...smsIds), to: Math.max(...smsIds) }
+      : undefined;
+
+  try {
+    await insertSyncRun({
+      userId: params.userId,
+      startedAt: new Date(params.startTime),
+      completedAt: new Date(),
+      durationMs: Date.now() - params.startTime,
+      status: "failed",
+      totalMessages: params.messages.length,
+      inserted: 0,
+      skipped: 0,
+      errors: params.messages.length,
+      messages: params.messages,
+      details: [],
+      errorMessage,
+      source: params.source,
+      rowidRange,
+    });
+  } catch (err) {
+    console.error(`${params.logPrefix} Failed to record failed sync run:`, err);
+  }
+
+  return errorMessage;
+}
 
 /**
  * Trigger push notification via Supabase Edge Function
@@ -95,29 +139,42 @@ router.post("/ingest", async (req: Request, res: Response) => {
     `[SMS Ingest] User ${user.id.substring(0, 8)}... - ${messages.length} messages`
   );
 
-  // Get categories and map for O(1) lookups
-  const categories = await getCategories(user.id);
-  const categoryMap = new Map(categories.map(c => [c.slug.toLowerCase(), c.id]));
-  const categoryDefMap = new Map(categories.map(c => [c.id, c]));
-
-  if (categories.length === 0) {
-    console.warn("No categories found, transactions will have null category");
-  }
-
-  // Get user merchant overrides (Phase 2 - Name map & default categorization/expense flags)
-  const userOverrides = await getUserMerchantMappings(user.id);
-  const overridesMap = new Map(userOverrides.map(o => [o.raw_merchant.toLowerCase(), o]));
-
-  // Parse and categorize with AI
+  let categories: Awaited<ReturnType<typeof getCategories>>;
+  let categoryMap: Map<string, string>;
+  let categoryDefMap: Map<string, (typeof categories)[number]>;
+  let overridesMap: Map<string, Awaited<ReturnType<typeof getUserMerchantMappings>>[number]>;
   let parsed;
+
   try {
+    // Get categories and map for O(1) lookups
+    categories = await getCategories(user.id);
+    categoryMap = new Map(categories.map(c => [c.slug.toLowerCase(), c.id]));
+    categoryDefMap = new Map(categories.map(c => [c.id, c]));
+
+    if (categories.length === 0) {
+      console.warn("No categories found, transactions will have null category");
+    }
+
+    // Get user merchant overrides (Phase 2 - Name map & default categorization/expense flags)
+    const userOverrides = await getUserMerchantMappings(user.id);
+    overridesMap = new Map(userOverrides.map(o => [o.raw_merchant.toLowerCase(), o]));
+
+    // Parse and categorize with AI
     parsed = await parseAndCategorize(messages, categories);
   } catch (error) {
-    console.error("[SMS Ingest] AI parsing failed:", error);
+    console.error("[SMS Ingest] Pre-processing failed:", error);
+    const errorMessage = await recordFailedSyncRun({
+      userId: user.id,
+      startTime,
+      messages,
+      source: "sms_sync",
+      error,
+      logPrefix: "[SMS Ingest]",
+    });
     res.status(500).json({
       success: false,
-      error: "Failed to parse SMS with AI",
-      details: String(error),
+      error: "Failed to process SMS batch",
+      details: errorMessage,
     });
     return;
   }
@@ -132,6 +189,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
   let errors = 0;
   const details: ParsedTransactionResult[] = [];
 
+  try {
   for (const msg of messages) {
     const txn = parsedMap.get(msg.id);
 
@@ -275,8 +333,25 @@ router.post("/ingest", async (req: Request, res: Response) => {
     inserted = bulkResult.inserted;
     errors = bulkResult.errors;
 
-    // For absolute accuracy we'd map bulk errors back to `details`, 
+    // For absolute accuracy we'd map bulk errors back to `details`,
     // but the original code also just pushed to arrays and counted.
+  }
+  } catch (error) {
+    console.error("[SMS Ingest] Processing/insert failed:", error);
+    const errorMessage = await recordFailedSyncRun({
+      userId: user.id,
+      startTime,
+      messages,
+      source: "sms_sync",
+      error,
+      logPrefix: "[SMS Ingest]",
+    });
+    res.status(500).json({
+      success: false,
+      error: "Failed to process transactions",
+      details: errorMessage,
+    });
+    return;
   }
 
   const completedAt = new Date();
@@ -396,10 +471,30 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
 
   // Continue processing in background
   (async () => {
+    let normalizedMessages: (SMSMessage & { timestamp: string })[] = [];
     try {
       console.log(
         `[Shortcut Ingest] User ${user.id.substring(0, 8)}... - ${messages.length} messages`
       );
+
+      // Normalize up-front so any downstream error can still record a sync_run with the batch
+      normalizedMessages = messages.map((msg: any) => {
+        const senderStr = msg.sender || "Unknown";
+        const bodyStr = msg.body || "";
+        const timestampStr = msg.timestamp || "";
+        const hashHex = crypto
+          .createHash("sha256")
+          .update(`${senderStr}|${bodyStr}|${timestampStr}`)
+          .digest("hex")
+          .substring(0, 13);
+        const numericId = parseInt(hashHex, 16);
+        return {
+          id: numericId,
+          sender: senderStr,
+          body: bodyStr,
+          timestamp: msg.timestamp || new Date().toISOString(),
+        };
+      });
 
       // Get categories and map for O(1) lookups
       const categories = await getCategories(user.id);
@@ -465,36 +560,20 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
         return true;
       };
 
-      // Transform iOS Shortcut format to internal format
-      const normalizedMessages = messages.map((msg: any) => {
-        const senderStr = msg.sender || "Unknown";
-        const bodyStr = msg.body || "";
-
-        const timestampStr = msg.timestamp || "";
-
-        // Generate a deterministic numeric ID from sender + body + timestamp hash to prevent duplicates
-        // We use the first 13 hex characters of SHA-256 (52 bits) to fit within JS MAX_SAFE_INTEGER
-        const hashHex = crypto
-          .createHash("sha256")
-          .update(`${senderStr}|${bodyStr}|${timestampStr}`)
-          .digest("hex")
-          .substring(0, 13);
-        const numericId = parseInt(hashHex, 16);
-
-        return {
-          id: numericId,
-          sender: senderStr,
-          body: bodyStr,
-          timestamp: msg.timestamp || new Date().toISOString()
-        };
-      });
-
       // Parse and categorize with AI
       let parsed;
       try {
         parsed = await parseAndCategorize(normalizedMessages, categories);
       } catch (error) {
         console.error("[Shortcut Ingest] AI parsing failed:", error);
+        await recordFailedSyncRun({
+          userId: user.id,
+          startTime,
+          messages: normalizedMessages,
+          source: "ios_shortcut",
+          error,
+          logPrefix: "[Shortcut Ingest]",
+        });
         return;
       }
 
@@ -712,6 +791,14 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
       });
     } catch (error) {
       console.error("[Shortcut Ingest] Background processing error:", error);
+      await recordFailedSyncRun({
+        userId: user.id,
+        startTime,
+        messages: normalizedMessages,
+        source: "ios_shortcut",
+        error,
+        logPrefix: "[Shortcut Ingest]",
+      });
     }
   })();
 });
