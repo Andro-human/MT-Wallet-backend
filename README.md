@@ -33,8 +33,11 @@ API_KEY=your-secure-ingest-key
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 
-# Google AI (Gemini)
+# Google AI (Gemini) - primary
 GOOGLE_GENERATIVE_AI_API_KEY=your-gemini-api-key
+
+# Groq AI - optional fallback when Gemini fails
+GROQ_API_KEY=your-groq-api-key
 
 # Push Notifications (Web Push)
 VAPID_PUBLIC_KEY=your-vapid-public-key
@@ -51,7 +54,7 @@ npm run dev
 
 The ingestion pipeline is designed for absolute reliability:
 ```
-iOS Shortcut (Worker) → Backend API → Gemini AI → Supabase DB → Push Notification Event
+iOS Shortcut (Worker) → Backend API → Gemini (Groq fallback) → Supabase DB → Push Notification Event
 ```
 
 1. **iOS Background Automation** intercepts SMS, batches them, and fires them to `/api/sms/ingest`.

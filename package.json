@@ -16,6 +16,7 @@
   "license": "MIT",
   "dependencies": {
     "@ai-sdk/google": "^1.0.0",
+    "@ai-sdk/groq": "^1.0.0",
     "@supabase/supabase-js": "^2.47.0",
     "ai": "^4.0.0",
     "cors": "^2.8.5",

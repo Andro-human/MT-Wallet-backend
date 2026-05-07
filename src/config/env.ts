@@ -22,8 +22,14 @@ function optionalEnv(name: string, defaultValue: string): string {
 console.log("[env] Loading environment variables...");
 
 // Validate all required env vars upfront so we fail fast with a clear message
-const requiredVars = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"];
-const missing = requiredVars.filter(name => !process.env[name]);
+// Google is primary; Groq is optional fallback.
+const requiredVars = [
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "GOOGLE_GENERATIVE_AI_API_KEY",
+  "GROQ_API_KEY",
+];
+const missing = requiredVars.filter((name) => !process.env[name]);
 if (missing.length > 0) {
   console.error(`FATAL: Missing required environment variables: ${missing.join(', ')}`);
   const envKeys = Object.keys(process.env)
@@ -44,8 +50,11 @@ export const env = {
   supabaseUrl: requireEnv("SUPABASE_URL"),
   supabaseServiceRoleKey: requireEnv("SUPABASE_SERVICE_ROLE_KEY"),
 
-  // Google AI (Gemini)
+  // Google AI (Gemini) - primary provider
   googleApiKey: requireEnv("GOOGLE_GENERATIVE_AI_API_KEY"),
+
+  // Groq AI - optional fallback when Gemini fails
+  groqApiKey: process.env.GROQ_API_KEY,
 } as const;
 
 console.log(`[env] Loaded: PORT=${env.port}, NODE_ENV=${env.nodeEnv}`);

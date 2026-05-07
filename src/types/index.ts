@@ -45,6 +45,7 @@ export interface IngestResponse {
 export interface ParsedTransactionResult {
   sms_id: number;
   status: "inserted" | "skipped" | "error";
+  ai_model?: string;
   reason?: string;
   transaction?: {
     amount: number;

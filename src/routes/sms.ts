@@ -16,6 +16,14 @@ import { env } from "../config/env.js";
 
 const router = Router();
 
+function sanitizeErrorForStorage(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  return raw
+    .replace(/AIza[0-9A-Za-z\-_]{20,}/g, "[REDACTED_GOOGLE_KEY]")
+    .replace(/gsk_[A-Za-z0-9]{20,}/g, "[REDACTED_GROQ_KEY]")
+    .replace(/Bearer\s+[A-Za-z0-9\-\._~\+\/]+=*/gi, "Bearer [REDACTED_TOKEN]");
+}
+
 /**
  * Record a failed sync run for any post-auth failure. Always awaits so the row
  * lands before the handler returns, and never throws (catches its own errors).
@@ -28,8 +36,7 @@ async function recordFailedSyncRun(params: {
   error: unknown;
   logPrefix: string;
 }): Promise<string> {
-  const errorMessage =
-    params.error instanceof Error ? params.error.message : String(params.error);
+  const errorMessage = sanitizeErrorForStorage(params.error);
   const smsIds = params.messages.map((m) => m.id);
   const rowidRange =
     smsIds.length > 0
@@ -144,6 +151,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
   let categoryDefMap: Map<string, (typeof categories)[number]>;
   let overridesMap: Map<string, Awaited<ReturnType<typeof getUserMerchantMappings>>[number]>;
   let parsed;
+  let aiModelUsed = "unknown";
 
   try {
     // Get categories and map for O(1) lookups
@@ -160,7 +168,9 @@ router.post("/ingest", async (req: Request, res: Response) => {
     overridesMap = new Map(userOverrides.map(o => [o.raw_merchant.toLowerCase(), o]));
 
     // Parse and categorize with AI
-    parsed = await parseAndCategorize(messages, categories);
+    const aiResult = await parseAndCategorize(messages, categories);
+    parsed = aiResult.parsed;
+    aiModelUsed = aiResult.model;
   } catch (error) {
     console.error("[SMS Ingest] Pre-processing failed:", error);
     const errorMessage = await recordFailedSyncRun({
@@ -199,6 +209,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
       details.push({
         sms_id: msg.id,
         status: "skipped",
+        ai_model: aiModelUsed,
         reason: "No AI result for this message",
       });
       continue;
@@ -210,6 +221,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
       details.push({
         sms_id: msg.id,
         status: "skipped",
+        ai_model: aiModelUsed,
         reason: txn.skip_reason || "Not a transaction",
       });
       continue;
@@ -221,6 +233,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
       details.push({
         sms_id: msg.id,
         status: "skipped",
+        ai_model: aiModelUsed,
         reason: "Missing amount or direction",
       });
       continue;
@@ -318,6 +331,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
     details.push({
       sms_id: msg.id,
       status: "inserted",
+      ai_model: aiModelUsed,
       transaction: {
         amount: txn.amount,
         direction: txn.direction,
@@ -562,8 +576,11 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
 
       // Parse and categorize with AI
       let parsed;
+      let aiModelUsed = "unknown";
       try {
-        parsed = await parseAndCategorize(normalizedMessages, categories);
+        const aiResult = await parseAndCategorize(normalizedMessages, categories);
+        parsed = aiResult.parsed;
+        aiModelUsed = aiResult.model;
       } catch (error) {
         console.error("[Shortcut Ingest] AI parsing failed:", error);
         await recordFailedSyncRun({
@@ -596,6 +613,7 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
           details.push({
             sms_id: msg.id,
             status: "skipped",
+            ai_model: aiModelUsed,
             reason: "No AI result for this message",
           });
           continue;
@@ -607,6 +625,7 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
           details.push({
             sms_id: msg.id,
             status: "skipped",
+            ai_model: aiModelUsed,
             reason: txn.skip_reason || "Not a transaction",
           });
           continue;
@@ -618,6 +637,7 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
           details.push({
             sms_id: msg.id,
             status: "skipped",
+            ai_model: aiModelUsed,
             reason: "Missing amount or direction",
           });
           continue;
@@ -723,6 +743,7 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
         details.push({
           sms_id: msg.id,
           status: "inserted",
+          ai_model: aiModelUsed,
           transaction: {
             amount: txn.amount,
             direction: txn.direction,
