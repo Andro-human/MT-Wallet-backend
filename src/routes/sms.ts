@@ -80,7 +80,9 @@ async function triggerPushNotification(syncRun: {
   total_messages: number;
   transactions?: { amount: number; direction: string; merchant: string | null }[];
 }) {
-  if (!syncRun.inserted || syncRun.inserted === 0) return;
+  const shouldNotifyFailure = syncRun.status === "failed";
+  const hasInsertedTransactions = (syncRun.inserted ?? 0) > 0;
+  if (!hasInsertedTransactions && !shouldNotifyFailure) return;
 
   try {
     const response = await fetch(
@@ -180,6 +182,14 @@ router.post("/ingest", async (req: Request, res: Response) => {
       source: "sms_sync",
       error,
       logPrefix: "[SMS Ingest]",
+    });
+    void triggerPushNotification({
+      user_id: user.id,
+      status: "failed",
+      inserted: 0,
+      skipped: 0,
+      errors: messages.length,
+      total_messages: messages.length,
     });
     res.status(500).json({
       success: false,
@@ -359,6 +369,14 @@ router.post("/ingest", async (req: Request, res: Response) => {
       source: "sms_sync",
       error,
       logPrefix: "[SMS Ingest]",
+    });
+    void triggerPushNotification({
+      user_id: user.id,
+      status: "failed",
+      inserted: 0,
+      skipped: 0,
+      errors: messages.length,
+      total_messages: messages.length,
     });
     res.status(500).json({
       success: false,
@@ -591,6 +609,14 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
           error,
           logPrefix: "[Shortcut Ingest]",
         });
+        void triggerPushNotification({
+          user_id: user.id,
+          status: "failed",
+          inserted: 0,
+          skipped: 0,
+          errors: normalizedMessages.length,
+          total_messages: normalizedMessages.length,
+        });
         return;
       }
 
@@ -819,6 +845,14 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
         source: "ios_shortcut",
         error,
         logPrefix: "[Shortcut Ingest]",
+      });
+      void triggerPushNotification({
+        user_id: user.id,
+        status: "failed",
+        inserted: 0,
+        skipped: 0,
+        errors: normalizedMessages.length,
+        total_messages: normalizedMessages.length,
       });
     }
   })();
