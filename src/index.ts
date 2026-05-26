@@ -32,12 +32,14 @@ async function main() {
     { env },
     { default: smsRoutes },
     { default: importRoutes },
+    { default: syncRunsRoutes },
   ] = await Promise.all([
     import("express"),
     import("cors"),
     import("./config/env.js"),
     import("./routes/sms.js"),
     import("./routes/import.js"),
+    import("./routes/sync-runs.js"),
   ]);
 
   console.log("[startup] All modules loaded successfully.");
@@ -59,6 +61,7 @@ async function main() {
   // Routes
   app.use("/api/sms", smsRoutes);
   app.use("/api/import", importRoutes);
+  app.use("/api/sync-runs", syncRunsRoutes);
 
   // Root health check
   app.get("/", (_req, res) => {
@@ -84,10 +87,9 @@ async function main() {
     });
   }) as import("express").ErrorRequestHandler);
 
-  // Start server — bind to 0.0.0.0 explicitly (Azure containers require this)
-  const host = "0.0.0.0";
-  const server = app.listen(env.port, host, () => {
-    console.log(`[startup] Server listening on http://${host}:${env.port}`);
+ 
+  const server = app.listen(env.port, () => {
+    console.log(`[startup] Server listening on http://localhost:${env.port}`);
     console.log(`[startup] Environment: ${env.nodeEnv}`);
   });
 

@@ -132,6 +132,107 @@ export async function insertTransactions(
 }
 
 /**
+ * Look up a sync_run owned by the given user. Returns null if not found or not
+ * owned. Used by the reclassify endpoints to verify the message exists in this
+ * run + belongs to the caller before mutating anything.
+ */
+export async function getSyncRunForUser(
+  runId: string,
+  userId: string
+): Promise<{
+  id: string;
+  user_id: string;
+  messages: { id: number; sender: string; body: string; timestamp: string | null }[] | null;
+} | null> {
+  const { data, error } = await supabase
+    .from("sync_runs")
+    .select("id, user_id, messages")
+    .eq("id", runId)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Failed to fetch sync run:", error.message);
+    return null;
+  }
+  return (data as any) ?? null;
+}
+
+/**
+ * After a reclassify, patch the sync_run's `details` array (the per-message
+ * snapshot stored at ingest time) so the UI's status badge / counts reflect
+ * the user's correction without needing a separate "manual override" join.
+ *
+ * - Replaces the existing detail entry for sms_id (or appends if none).
+ * - Recomputes inserted/skipped/errors from the new details array.
+ */
+export async function updateSyncRunDetail(params: {
+  runId: string;
+  userId: string;
+  smsId: number;
+  newDetail: ParsedTransactionResult;
+}): Promise<{ success: boolean; error?: string }> {
+  const { data: run, error: fetchErr } = await supabase
+    .from("sync_runs")
+    .select("details")
+    .eq("id", params.runId)
+    .eq("user_id", params.userId)
+    .maybeSingle();
+  if (fetchErr || !run) {
+    return { success: false, error: fetchErr?.message || "Sync run not found" };
+  }
+
+  const details = Array.isArray(run.details)
+    ? ([...run.details] as ParsedTransactionResult[])
+    : [];
+  const idx = details.findIndex((d) => Number(d.sms_id) === params.smsId);
+  if (idx >= 0) {
+    details[idx] = params.newDetail;
+  } else {
+    details.push(params.newDetail);
+  }
+
+  let inserted = 0;
+  let skipped = 0;
+  let errors = 0;
+  for (const d of details) {
+    if (d.status === "inserted") inserted++;
+    else if (d.status === "skipped") skipped++;
+    else if (d.status === "error") errors++;
+  }
+
+  const { error: updateErr } = await supabase
+    .from("sync_runs")
+    .update({ details, inserted, skipped, errors })
+    .eq("id", params.runId)
+    .eq("user_id", params.userId);
+  if (updateErr) {
+    return { success: false, error: updateErr.message };
+  }
+  return { success: true };
+}
+
+/**
+ * Delete any transaction matching (user_id, sms_id). No-op if none exists.
+ */
+export async function deleteTransactionBySmsId(
+  userId: string,
+  smsId: number
+): Promise<{ success: boolean; error?: string }> {
+  const { error } = await supabase
+    .from("transactions")
+    .delete()
+    .eq("user_id", userId)
+    .eq("sms_id", smsId);
+
+  if (error) {
+    console.error("Failed to delete transaction by sms_id:", error.message);
+    return { success: false, error: error.message };
+  }
+  return { success: true };
+}
+
+/**
  * Insert a sync run record
  */
 export async function insertSyncRun(params: {

@@ -216,6 +216,89 @@ RULES FOR PARSING:
 /**
  * Parse and categorize SMS messages using configured AI provider
  */
+// Extraction-only schema: no classification, all fields nullable. Used by the
+// reclassify endpoint when the user has already decided the SMS is a transaction
+// and we just need to pull the literal fields.
+const ExtractedFieldsSchema = z.object({
+  amount: z.number().positive().nullable(),
+  currency: z.string().nullable(),
+  direction: z.enum(["credit", "debit"]).nullable(),
+  merchant: z.string().nullable(),
+  account_last4: z.string().nullable(),
+  bank_name: z.string().nullable(),
+  reference_id: z.string().nullable(),
+  category_slug: z.string().nullable(),
+});
+
+export type ExtractedFields = z.infer<typeof ExtractedFieldsSchema>;
+
+/**
+ * Extract transaction fields from a single SMS, assuming the caller has already
+ * decided it IS a transaction. Prompt asks ONLY for extraction — no classification
+ * language — and explicitly permits null for any field not clearly present, so
+ * the model has no incentive to hallucinate (e.g. inventing an amount from an
+ * OTP code).
+ */
+export async function extractTransactionFields(
+  message: { body: string; sender: string },
+  categories: Category[]
+): Promise<{ fields: ExtractedFields; model: string }> {
+  const categoryList = categories.map((c) => c.slug).join(", ");
+
+  const systemPrompt = `You extract structured transaction fields from a single banking SMS message. The caller has already decided this SMS represents a financial transaction; do not re-classify, do not refuse.
+
+RULES:
+1. Extract fields ONLY when they are clearly present in the SMS text. If a field is not present, return null for it. Do NOT guess, infer, or invent values.
+2. amount: the transaction amount, NOT "Available Balance" or "Avl Limit". If no amount is clearly stated, return null.
+3. currency: ISO code (INR, USD, EUR, GBP, ...). Default to "INR" if the SMS is from an Indian bank and no other currency is shown. Return null only if you genuinely cannot tell.
+4. direction: "debit" for money out ("debited", "spent", "paid"), "credit" for money in ("credited", "received"). Return null if neither is clearly indicated.
+5. merchant: precise merchant name or UPI ID (e.g. "merchant@upi"). Null if not present.
+6. account_last4: last 4 digits of card/account (e.g. "Card XX1234" -> "1234"). Null if not present.
+7. bank_name: the issuing bank if mentioned. Null otherwise.
+8. reference_id: transaction ref or UPI ref number. Null if not present.
+9. category_slug: best fit from this list: [${categoryList}]. Use "other" only if a category is clearly required but no specific one fits. Null if the SMS lacks enough information to categorize.
+
+OUTPUT: a single JSON object with the keys above. No markdown, no commentary.`;
+
+  const userPrompt = `SMS sender: ${message.sender}
+SMS body:
+"""
+${message.body}
+"""`;
+
+  // Try primary then fallback, mirroring parseAndCategorize.
+  const callOnce = async (provider: "google" | "groq", modelId: string) => {
+    const result = await generateObject({
+      model: getModel(provider, modelId),
+      schema: ExtractedFieldsSchema,
+      system: systemPrompt,
+      prompt: userPrompt,
+      temperature: 0,
+      maxRetries: 0,
+    });
+    return result.object;
+  };
+
+  try {
+    const fields = await callOnce(PRIMARY_PROVIDER, PRIMARY_MODEL);
+    return { fields, model: PRIMARY_MODEL };
+  } catch (primaryErr) {
+    console.warn(
+      `[ai] extractTransactionFields primary ${PRIMARY_MODEL} failed (${sanitizeErrorMessage(primaryErr)}); falling back to ${FALLBACK_MODEL}`
+    );
+    try {
+      const fields = await callOnce(FALLBACK_PROVIDER, FALLBACK_MODEL);
+      return { fields, model: FALLBACK_MODEL };
+    } catch (fallbackErr) {
+      console.error("[ai] extractTransactionFields both providers failed", {
+        primary: sanitizeErrorMessage(primaryErr),
+        fallback: sanitizeErrorMessage(fallbackErr),
+      });
+      throw new Error("Failed to extract transaction fields with AI.");
+    }
+  }
+}
+
 export async function parseAndCategorize(
   messages: SMSMessage[],
   categories: Category[]
