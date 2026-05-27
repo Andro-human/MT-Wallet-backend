@@ -154,6 +154,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
   let overridesMap: Map<string, Awaited<ReturnType<typeof getUserMerchantMappings>>[number]>;
   let parsed;
   let aiModelUsed = "unknown";
+  let aiUsage: Record<string, { input: number; output: number }> = {};
 
   try {
     // Get categories and map for O(1) lookups
@@ -173,6 +174,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
     const aiResult = await parseAndCategorize(messages, categories);
     parsed = aiResult.parsed;
     aiModelUsed = aiResult.model;
+    aiUsage = aiResult.usage;
   } catch (error) {
     console.error("[SMS Ingest] Pre-processing failed:", error);
     const errorMessage = await recordFailedSyncRun({
@@ -420,6 +422,7 @@ router.post("/ingest", async (req: Request, res: Response) => {
     details,
     source: "sms_sync",
     rowidRange,
+    usage: aiUsage,
   }).catch((err) => {
     console.error("[SMS Ingest] Failed to record sync run:", err);
   });
@@ -595,10 +598,12 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
       // Parse and categorize with AI
       let parsed;
       let aiModelUsed = "unknown";
+      let aiUsage: Record<string, { input: number; output: number }> = {};
       try {
         const aiResult = await parseAndCategorize(normalizedMessages, categories);
         parsed = aiResult.parsed;
         aiModelUsed = aiResult.model;
+        aiUsage = aiResult.usage;
       } catch (error) {
         console.error("[Shortcut Ingest] AI parsing failed:", error);
         await recordFailedSyncRun({
@@ -820,6 +825,7 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
         details,
         source: "ios_shortcut",
         rowidRange,
+        usage: aiUsage,
       }).catch((err) => {
         console.error("[Shortcut Ingest] Failed to record sync run:", err);
       });

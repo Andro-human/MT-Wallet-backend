@@ -4,7 +4,10 @@ import { groq } from "@ai-sdk/groq";
 import { z } from "zod";
 import type { SMSMessage, Category } from "../types/index.js";
 
-// Schema for LLM output - single transaction
+// ── Schemas ─────────────────────────────────────────────────────────────────
+
+// Public-facing parsed-transaction shape consumed by /ingest and
+// /shortcut-ingest. Produced by `parseAndCategorize`'s two-pass merge.
 const TransactionOutputSchema = z.object({
   sms_id: z.number().describe("The SMS message ID from input"),
   is_transaction: z
@@ -59,23 +62,107 @@ const TransactionOutputSchema = z.object({
     .describe("Why this SMS is not a transaction"),
 });
 
-// Schema for the full response array
-const TransactionsArraySchema = z.array(TransactionOutputSchema);
+// Extraction-only schema (single-message), used by the /reclassify endpoint
+// when the user has already decided the SMS is a transaction and we just need
+// to pull the literal fields. Every field is nullable so the model has no
+// incentive to invent values (e.g. mistaking an OTP code for an amount).
+const ExtractedFieldsSchema = z.object({
+  amount: z
+    .number()
+    .positive()
+    .nullable()
+    .describe("Transaction amount as shown in SMS (e.g., 5.90 for 'USD 5.90', 296.00 for 'INR 296.00'). Null if not clearly stated."),
+  currency: z
+    .string()
+    .nullable()
+    .describe("Currency code: 'INR', 'USD', 'EUR', 'GBP', etc. Default to 'INR' if not specified."),
+  direction: z
+    .enum(["credit", "debit"])
+    .nullable()
+    .describe("credit = money received, debit = money spent. Null if neither is clearly indicated."),
+  merchant: z
+    .string()
+    .nullable()
+    .describe("Merchant or sender name, or UPI ID."),
+  account_last4: z
+    .string()
+    .nullable()
+    .describe("Last 4 digits of card/account number."),
+  bank_name: z
+    .string()
+    .nullable()
+    .describe("Bank name."),
+  reference_id: z
+    .string()
+    .nullable()
+    .describe("Transaction reference or UPI ref number."),
+  category_slug: z
+    .string()
+    .nullable()
+    .describe("Category slug from the allowed list provided in the prompt."),
+});
+
+// Two-pass ingest schemas. Pass 1 returns is_transaction per message (tiny
+// schema, runs on the cheap classifier model). Pass 2 returns extracted fields
+// keyed by sms_id, but only for messages classified as transactions.
+const ClassificationItemSchema = z.object({
+  sms_id: z.number().describe("The SMS message ID from input"),
+  is_transaction: z
+    .boolean()
+    .describe(
+      "True only when the SMS confirms money has ALREADY moved (past-tense: debited/credited/spent/received/paid/transferred/withdrawn). False for OTPs, payment authorization, balance checks, statements, promotions, or any pending/upcoming wording — even when amount/merchant/card are mentioned.",
+    ),
+  skip_reason: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("Brief reason when is_transaction is false (e.g. 'OTP', 'Balance notification'). Null/omitted when is_transaction is true."),
+});
+const ClassificationsArraySchema = z.array(ClassificationItemSchema);
+
+const BatchExtractedItemSchema = ExtractedFieldsSchema.extend({
+  sms_id: z.number().describe("The SMS message ID from input"),
+});
+const BatchExtractedArraySchema = z.array(BatchExtractedItemSchema);
+
+// ── Exported types ─────────────────────────────────────────────────────────
 
 export type ParsedTransaction = z.infer<typeof TransactionOutputSchema>;
+export type ExtractedFields = z.infer<typeof ExtractedFieldsSchema>;
+
+/**
+ * Per-model token usage, keyed by model id (e.g. "gemini-2.5-flash-lite").
+ * Multiple calls to the same model accumulate into the same bucket so a
+ * sync_run that hits classifier + extractor (different models) shows two
+ * entries, while one that falls back to the same model twice shows one.
+ */
+export type ModelUsage = Record<string, { input: number; output: number }>;
+
 export interface ParseAndCategorizeResult {
   parsed: ParsedTransaction[];
   model: string;
+  usage: ModelUsage;
 }
 
+// ── Constants ──────────────────────────────────────────────────────────────
+
+// Extractor model: needs to reason about structured field extraction.
 const PRIMARY_PROVIDER = "google";
 const PRIMARY_MODEL = "gemini-2.5-flash";
 const FALLBACK_PROVIDER = "groq";
 const FALLBACK_MODEL = "llama-3.3-70b-versatile";
 
+// Classifier model: tiny task (yes/no + skip reason). Use the cheapest
+// reliable Google tier; falls back to the same Groq model as extraction.
+// 90%+ of incoming SMS are non-transactional, so this pass shoulders most of
+// the per-batch work.
+const CLASSIFIER_MODEL = "gemini-2.5-flash-lite";
+
 const MAX_ATTEMPTS = 2;
 const BASE_DELAY_MS = 500;
 const MAX_DELAY_MS = 8000;
+
+// ── Low-level helpers ──────────────────────────────────────────────────────
 
 function getModel(provider: "google" | "groq", modelId: string) {
   return provider === "google" ? google(modelId) : groq(modelId);
@@ -92,7 +179,16 @@ function sanitizeErrorMessage(error: unknown): string {
     .replace(/gsk_[A-Za-z0-9]{20,}/g, "[REDACTED_GROQ_KEY]");
 }
 
-function tryRecoverTransactionsFromError(error: unknown): ParsedTransaction[] | null {
+/**
+ * When generateObject throws because the model output didn't validate against
+ * the schema, the raw text is often tucked into `error.cause.value`. Try to
+ * parse that and validate it against `arraySchema` — recovers from minor JSON
+ * envelope issues without needing a full retry.
+ */
+function tryRecoverArrayFromError<T extends z.ZodTypeAny>(
+  error: unknown,
+  arraySchema: z.ZodArray<T>,
+): z.infer<typeof arraySchema> | null {
   if (!(error instanceof Error)) return null;
   const cause = (error as Error & { cause?: unknown }).cause;
   if (!cause || typeof cause !== "object") return null;
@@ -112,44 +208,35 @@ function tryRecoverTransactionsFromError(error: unknown): ParsedTransaction[] | 
 
   const parsedValue = parseValue(value);
   if (Array.isArray(parsedValue)) {
-    const validated = TransactionsArraySchema.safeParse(parsedValue);
+    const validated = arraySchema.safeParse(parsedValue);
     return validated.success ? validated.data : null;
   }
 
   if (parsedValue && typeof parsedValue === "object") {
-    const wrapped = [parsedValue];
-    const validated = TransactionsArraySchema.safeParse(wrapped);
+    const validated = arraySchema.safeParse([parsedValue]);
     return validated.success ? validated.data : null;
   }
 
   return null;
 }
 
-function assertParsedMatchesMessages(parsed: ParsedTransaction[], messages: SMSMessage[]): void {
-  if (parsed.length !== messages.length) {
-    throw new Error("AI output count does not match input message count.");
-  }
+type CallResult<T> = { data: T; input: number; output: number };
 
-  const expectedIds = new Set(messages.map((m) => m.id));
-  const seen = new Set<number>();
-
-  for (const row of parsed) {
-    if (!expectedIds.has(row.sms_id)) {
-      throw new Error("AI output contains unknown sms_id.");
-    }
-    if (seen.has(row.sms_id)) {
-      throw new Error("AI output contains duplicate sms_id.");
-    }
-    seen.add(row.sms_id);
-  }
+/** Accumulate per-model token usage into an aggregator map (mutates in place). */
+function addUsage(into: ModelUsage, model: string, input: number, output: number) {
+  const bucket = into[model] ?? { input: 0, output: 0 };
+  bucket.input += input;
+  bucket.output += output;
+  into[model] = bucket;
 }
 
-async function callModelWithRetry(
+async function callModelWithRetry<T extends z.ZodTypeAny>(
   provider: "google" | "groq",
   modelId: string,
   systemPrompt: string,
-  userPrompt: string
-): Promise<ParsedTransaction[]> {
+  userPrompt: string,
+  schema: z.ZodArray<T>,
+): Promise<CallResult<z.infer<z.ZodArray<T>>>> {
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -160,7 +247,7 @@ async function callModelWithRetry(
 
       const result = await generateObject({
         model: getModel(provider, modelId),
-        schema: TransactionsArraySchema,
+        schema,
         system: systemPrompt,
         prompt: userPrompt,
         temperature: 0,
@@ -169,12 +256,19 @@ async function callModelWithRetry(
       if (attempt > 1) {
         console.log(`[ai] ${modelId} succeeded on attempt ${attempt}/${MAX_ATTEMPTS}`);
       }
-      return result.object;
+      return {
+        data: result.object,
+        input: result.usage?.promptTokens ?? 0,
+        output: result.usage?.completionTokens ?? 0,
+      };
     } catch (error) {
-      const recovered = tryRecoverTransactionsFromError(error);
+      const recovered = tryRecoverArrayFromError(error, schema);
       if (recovered) {
-        console.warn(`[ai] ${modelId} recovered structured output from provider error envelope`);
-        return recovered;
+        // Recovered output didn't go through generateObject's usage tally — we
+        // don't have a reliable token count for these. Report 0 so the row is
+        // visibly suspicious in the UI rather than over- or under-counting.
+        console.warn(`[ai] ${modelId} recovered structured output from provider error envelope (usage unknown)`);
+        return { data: recovered, input: 0, output: 0 };
       }
       lastError = error;
       const message = sanitizeErrorMessage(error);
@@ -193,51 +287,114 @@ async function callModelWithRetry(
   throw lastError;
 }
 
-/**
- * Build the system prompt for SMS parsing
- */
-function buildSystemPrompt(categories: Category[]): string {
-  const categoryList = categories.map((c) => c.slug).join(", ");
+// ── Pass 1: classify ───────────────────────────────────────────────────────
 
-  return `You are an AI parser for Indian banking SMS messages.
-TASK: Extract financial transaction data.
-RULES FOR PARSING:
-1. Ignore OTPs, spam, and balance checks without actual money movement.
-2. Amount is the TRANSACTION amount, NOT "Available Balance" or "Avl Limit". Focus on words like "debited", "spent", "credited".
-3. For foreign currency (USD, EUR, etc.), set amount to the exact foreign value and currency to the code (e.g., "USD 5.90" -> 5.90, USD). Default to INR otherwise.
-4. "debited" or "spent" = debit (money out). "credited" or "received" = credit (money in).
-5. Extract precise merchant name, or extract UPI ID as merchant when available (e.g., "merchant@upi").
-6. Extract the last 4 digits of the card or account from patterns like "Card XX1234" or "ending 1234".
-7. category_slug: BEST fit from this valid list: [${categoryList}]. Use "other" if unsure.
-8. If any optional field is unknown, prefer omitting it. If present, it may be null.
-9. OUTPUT: Return a single JSON array only — no markdown fences, no commentary. One object per input message, same order. Every object MUST include sms_id (number, copied EXACTLY from the corresponding input message's sms_id) and is_transaction (boolean). Use direction with values "debit" or "credit" only — never use a field named "type". Use account_last4 for card/account last digits.`;
+const CLASSIFY_SYSTEM_PROMPT = `You classify Indian banking SMS messages as financial transactions or not. The per-field rules are in the schema descriptions; this prompt covers only the classification heuristic.
+
+A message is a transaction ONLY when it confirms money has ALREADY moved. Look for past-tense verbs: "debited", "credited", "spent", "received", "paid", "transferred", "withdrawn".
+
+It is NOT a transaction when it is an OTP, payment authorization prompt, balance/statement notification, promotional offer, or anything with "pending"/"upcoming" wording — EVEN when an amount, merchant, or card is mentioned. OTPs typically say "OTP", "do not share", or "to verify/confirm" and authorize a FUTURE transaction; they are not transactions themselves.
+
+Output one object per input message in the same order. Copy sms_id EXACTLY from the corresponding input.`;
+
+async function classifyBatch(
+  messages: SMSMessage[],
+  usage: ModelUsage,
+): Promise<{ classifications: z.infer<typeof ClassificationsArraySchema>; model: string }> {
+  const messagesForPrompt = messages.map((m) => ({
+    sms_id: m.id,
+    body: m.body,
+    sender: m.sender,
+  }));
+  const userPrompt = `INPUT MESSAGES:\n\`\`\`json\n${JSON.stringify(messagesForPrompt)}\n\`\`\``;
+
+  try {
+    const result = await callModelWithRetry(
+      PRIMARY_PROVIDER,
+      CLASSIFIER_MODEL,
+      CLASSIFY_SYSTEM_PROMPT,
+      userPrompt,
+      ClassificationsArraySchema,
+    );
+    addUsage(usage, CLASSIFIER_MODEL, result.input, result.output);
+    return { classifications: result.data, model: CLASSIFIER_MODEL };
+  } catch (primaryErr) {
+    console.warn(
+      `[ai] classifier ${CLASSIFIER_MODEL} exhausted retries (${sanitizeErrorMessage(primaryErr)}); falling back to ${FALLBACK_MODEL}`,
+    );
+    const result = await callModelWithRetry(
+      FALLBACK_PROVIDER,
+      FALLBACK_MODEL,
+      CLASSIFY_SYSTEM_PROMPT,
+      userPrompt,
+      ClassificationsArraySchema,
+    );
+    addUsage(usage, FALLBACK_MODEL, result.input, result.output);
+    return { classifications: result.data, model: FALLBACK_MODEL };
+  }
 }
 
-/**
- * Parse and categorize SMS messages using configured AI provider
- */
-// Extraction-only schema: no classification, all fields nullable. Used by the
-// reclassify endpoint when the user has already decided the SMS is a transaction
-// and we just need to pull the literal fields.
-const ExtractedFieldsSchema = z.object({
-  amount: z.number().positive().nullable(),
-  currency: z.string().nullable(),
-  direction: z.enum(["credit", "debit"]).nullable(),
-  merchant: z.string().nullable(),
-  account_last4: z.string().nullable(),
-  bank_name: z.string().nullable(),
-  reference_id: z.string().nullable(),
-  category_slug: z.string().nullable(),
-});
+// ── Pass 2: extract (only for messages classified as transactions) ─────────
 
-export type ExtractedFields = z.infer<typeof ExtractedFieldsSchema>;
+function buildExtractBatchPrompt(categories: Category[]): string {
+  const categoryList = categories.map((c) => c.slug).join(", ");
+  return `You extract transaction fields from Indian banking SMS messages. The caller has already classified each input as a financial transaction; do not re-classify, do not refuse. Per-field guidance is in the schema descriptions.
+
+Extract fields ONLY when clearly present. If a field is not clearly stated, return null — do NOT guess, infer, or invent values. Null is the correct answer when you are uncertain.
+
+amount trap: ignore "Available Balance" and "Avl Limit" — those are balance, not the transaction amount.
+
+category_slug: best fit from [${categoryList}]. Use "other" only when a category is clearly required but no specific one fits.
+
+Output one object per input message in the same order. Copy sms_id EXACTLY from the corresponding input.`;
+}
+
+async function extractBatch(
+  messages: SMSMessage[],
+  categories: Category[],
+  usage: ModelUsage,
+): Promise<{ extracts: z.infer<typeof BatchExtractedArraySchema>; model: string }> {
+  const systemPrompt = buildExtractBatchPrompt(categories);
+  const messagesForPrompt = messages.map((m) => ({
+    sms_id: m.id,
+    body: m.body,
+    sender: m.sender,
+  }));
+  const userPrompt = `INPUT MESSAGES:\n\`\`\`json\n${JSON.stringify(messagesForPrompt)}\n\`\`\``;
+
+  try {
+    const result = await callModelWithRetry(
+      PRIMARY_PROVIDER,
+      PRIMARY_MODEL,
+      systemPrompt,
+      userPrompt,
+      BatchExtractedArraySchema,
+    );
+    addUsage(usage, PRIMARY_MODEL, result.input, result.output);
+    return { extracts: result.data, model: PRIMARY_MODEL };
+  } catch (primaryErr) {
+    console.warn(
+      `[ai] extractor ${PRIMARY_MODEL} exhausted retries (${sanitizeErrorMessage(primaryErr)}); falling back to ${FALLBACK_MODEL}`,
+    );
+    const result = await callModelWithRetry(
+      FALLBACK_PROVIDER,
+      FALLBACK_MODEL,
+      systemPrompt,
+      userPrompt,
+      BatchExtractedArraySchema,
+    );
+    addUsage(usage, FALLBACK_MODEL, result.input, result.output);
+    return { extracts: result.data, model: FALLBACK_MODEL };
+  }
+}
+
+// ── Reclassify entry point (single SMS, called from /sync-runs/.../mark-transaction) ─────
 
 /**
- * Extract transaction fields from a single SMS, assuming the caller has already
- * decided it IS a transaction. Prompt asks ONLY for extraction — no classification
- * language — and explicitly permits null for any field not clearly present, so
- * the model has no incentive to hallucinate (e.g. inventing an amount from an
- * OTP code).
+ * Extract transaction fields from a single SMS, assuming the caller has
+ * already decided it IS a transaction. The prompt has no classification
+ * language and explicitly permits null for any field not clearly present,
+ * so the model has no incentive to hallucinate.
  */
 export async function extractTransactionFields(
   message: { body: string; sender: string },
@@ -245,20 +402,13 @@ export async function extractTransactionFields(
 ): Promise<{ fields: ExtractedFields; model: string }> {
   const categoryList = categories.map((c) => c.slug).join(", ");
 
-  const systemPrompt = `You extract structured transaction fields from a single banking SMS message. The caller has already decided this SMS represents a financial transaction; do not re-classify, do not refuse.
+  const systemPrompt = `You extract transaction fields from a single banking SMS. The caller has already decided this SMS is a transaction; do not re-classify, do not refuse. Per-field guidance is in the schema descriptions.
 
-RULES:
-1. Extract fields ONLY when they are clearly present in the SMS text. If a field is not present, return null for it. Do NOT guess, infer, or invent values.
-2. amount: the transaction amount, NOT "Available Balance" or "Avl Limit". If no amount is clearly stated, return null.
-3. currency: ISO code (INR, USD, EUR, GBP, ...). Default to "INR" if the SMS is from an Indian bank and no other currency is shown. Return null only if you genuinely cannot tell.
-4. direction: "debit" for money out ("debited", "spent", "paid"), "credit" for money in ("credited", "received"). Return null if neither is clearly indicated.
-5. merchant: precise merchant name or UPI ID (e.g. "merchant@upi"). Null if not present.
-6. account_last4: last 4 digits of card/account (e.g. "Card XX1234" -> "1234"). Null if not present.
-7. bank_name: the issuing bank if mentioned. Null otherwise.
-8. reference_id: transaction ref or UPI ref number. Null if not present.
-9. category_slug: best fit from this list: [${categoryList}]. Use "other" only if a category is clearly required but no specific one fits. Null if the SMS lacks enough information to categorize.
+Extract fields ONLY when clearly present. If a field is not clearly stated, return null — do NOT guess, infer, or invent values. Null is the correct answer when you are uncertain.
 
-OUTPUT: a single JSON object with the keys above. No markdown, no commentary.`;
+amount trap: ignore "Available Balance" and "Avl Limit" — those are balance, not the transaction amount.
+
+category_slug: best fit from [${categoryList}]. Use "other" only when a category is clearly required but no specific one fits.`;
 
   const userPrompt = `SMS sender: ${message.sender}
 SMS body:
@@ -266,7 +416,6 @@ SMS body:
 ${message.body}
 """`;
 
-  // Try primary then fallback, mirroring parseAndCategorize.
   const callOnce = async (provider: "google" | "groq", modelId: string) => {
     const result = await generateObject({
       model: getModel(provider, modelId),
@@ -299,54 +448,119 @@ ${message.body}
   }
 }
 
+// ── Ingest entry point (batched two-pass) ──────────────────────────────────
+
+/**
+ * Parse and categorize SMS messages using a two-pass flow:
+ *   Pass 1: cheap classifier model decides is_transaction for ALL messages.
+ *   Pass 2: extractor model runs ONLY on the survivors (often 10% of input).
+ *
+ * Most ingest batches are 90%+ non-transactional, so pass 2 is small or
+ * skipped entirely — net token spend goes down vs. the old single-pass design.
+ *
+ * Public return shape is unchanged (ParsedTransaction[]) so /ingest and
+ * /shortcut-ingest don't need updates. The `model` string reports the
+ * extractor model (or classifier model when pass 2 was skipped).
+ */
 export async function parseAndCategorize(
   messages: SMSMessage[],
   categories: Category[]
 ): Promise<ParseAndCategorizeResult> {
   if (messages.length === 0) {
-    return { parsed: [], model: PRIMARY_MODEL };
+    return { parsed: [], model: PRIMARY_MODEL, usage: {} };
   }
 
-  // Prepare messages for the prompt (only id and body needed)
-  const messagesForPrompt = messages.map((m) => ({
-    sms_id: m.id,
-    body: m.body,
-    sender: m.sender,
-  }));
+  const usage: ModelUsage = {};
 
-  const systemPrompt = buildSystemPrompt(categories);
-  const userPrompt = `INPUT MESSAGES:
-\`\`\`json
-${JSON.stringify(messagesForPrompt)}
-\`\`\`
-  `;
+  // ── Pass 1: classify everything ──────────────────────────────────────────
+  const { classifications, model: classifierModel } = await classifyBatch(messages, usage);
 
-  try {
-    const parsed = await callModelWithRetry(PRIMARY_PROVIDER, PRIMARY_MODEL, systemPrompt, userPrompt);
-    assertParsedMatchesMessages(parsed, messages);
-    return { parsed, model: PRIMARY_MODEL };
-  } catch (googleError) {
-    const googleMessage = sanitizeErrorMessage(googleError);
-    console.warn(
-      `[ai] ${PRIMARY_MODEL} exhausted ${MAX_ATTEMPTS} attempts (${googleMessage}); falling back to ${FALLBACK_MODEL}`
-    );
+  // Build a sms_id → classification map keyed by Number for safety. The
+  // model occasionally omits messages or duplicates ids; we tolerate both
+  // (missing entries get flagged during merge below).
+  const classByIds = new Map<number, z.infer<typeof ClassificationItemSchema>>();
+  for (const c of classifications) classByIds.set(Number(c.sms_id), c);
+
+  const survivors = messages.filter(
+    (m) => classByIds.get(Number(m.id))?.is_transaction === true,
+  );
+  console.log(
+    `[ai] Pass 1 done on ${classifierModel}: ${survivors.length}/${messages.length} classified as transactions`,
+  );
+
+  // ── Pass 2: extract fields, but only for survivors ───────────────────────
+  const extractsById = new Map<number, z.infer<typeof BatchExtractedItemSchema>>();
+  let extractorModel = classifierModel; // reported back when pass 2 is skipped
+  let pass2Failed = false;
+
+  if (survivors.length > 0) {
     try {
-      const parsed = await callModelWithRetry(
-        FALLBACK_PROVIDER,
-        FALLBACK_MODEL,
-        systemPrompt,
-        userPrompt
+      const { extracts, model } = await extractBatch(survivors, categories, usage);
+      extractorModel = model;
+      for (const e of extracts) extractsById.set(Number(e.sms_id), e);
+      console.log(
+        `[ai] Pass 2 done on ${model}: ${extracts.length}/${survivors.length} extracted`,
       );
-      assertParsedMatchesMessages(parsed, messages);
-      return { parsed, model: FALLBACK_MODEL };
-    } catch (groqError) {
-      console.error("[ai] Google and Groq both failed", {
-        googleError: googleMessage,
-        groqError: sanitizeErrorMessage(groqError),
-      });
-      throw new Error(
-        `Failed to parse SMS with AI after retries on ${PRIMARY_MODEL} and ${FALLBACK_MODEL}.`
+    } catch (err) {
+      // Pass 2 totally failed — log and proceed. Each survivor will be marked
+      // as a transaction in the merge but without fields, so the existing
+      // ingest loop will skip them with "Missing amount or direction" reason.
+      // User can recover via the reclassify dialog.
+      pass2Failed = true;
+      console.error(
+        `[ai] Pass 2 (extraction) failed for entire batch of ${survivors.length}; survivors will be marked needs-review:`,
+        sanitizeErrorMessage(err),
       );
     }
   }
+
+  // ── Merge: produce one ParsedTransaction per input message ───────────────
+  const parsed: ParsedTransaction[] = messages.map((m) => {
+    const c = classByIds.get(Number(m.id));
+    if (!c) {
+      return {
+        sms_id: m.id,
+        is_transaction: false,
+        skip_reason: "No classifier verdict for this message",
+      };
+    }
+
+    if (!c.is_transaction) {
+      return {
+        sms_id: m.id,
+        is_transaction: false,
+        skip_reason: c.skip_reason || "Classified as non-transaction",
+      };
+    }
+
+    // Classifier said it IS a transaction.
+    const ex = extractsById.get(Number(m.id));
+    if (!ex) {
+      // Either pass 2 failed entirely or the extractor dropped this message.
+      // Surface it as a transaction with no fields so the ingest loop's
+      // "Missing amount or direction" branch flags it as skipped.
+      return {
+        sms_id: m.id,
+        is_transaction: true,
+        skip_reason: pass2Failed
+          ? "Extraction failed; reclassify manually"
+          : "Extractor dropped this message",
+      };
+    }
+
+    return {
+      sms_id: m.id,
+      is_transaction: true,
+      amount: ex.amount ?? undefined,
+      currency: ex.currency ?? undefined,
+      direction: ex.direction ?? undefined,
+      merchant: ex.merchant,
+      account_last4: ex.account_last4,
+      bank_name: ex.bank_name,
+      reference_id: ex.reference_id,
+      category_slug: ex.category_slug,
+    };
+  });
+
+  return { parsed, model: extractorModel, usage };
 }

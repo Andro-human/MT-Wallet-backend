@@ -250,6 +250,9 @@ export async function insertSyncRun(params: {
   errorMessage?: string;
   source?: string;
   rowidRange?: { from: number; to: number };
+  // Per-model token usage. Shape: { [modelId]: { input, output } }.
+  // Null for failed runs that never produced AI usage data.
+  usage?: Record<string, { input: number; output: number }> | null;
 }): Promise<{ id: string | null; error?: string }> {
   const { data, error } = await supabase
     .from("sync_runs")
@@ -268,6 +271,7 @@ export async function insertSyncRun(params: {
       error_message: params.errorMessage || null,
       source: params.source || "sms_sync",
       rowid_range: params.rowidRange || null,
+      usage: params.usage ?? null,
     })
     .select("id")
     .single();
