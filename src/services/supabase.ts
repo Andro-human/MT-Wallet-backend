@@ -1,6 +1,6 @@
 import { createClient } from "@supabase/supabase-js";
 import { env } from "../config/env.js";
-import type { Category, User, ParsedTransactionResult, SMSMessage, UserMerchantMapping } from "../types/index.js";
+import type { Category, GmailWatchState, User, ParsedTransactionResult, SMSMessage, UserMerchantMapping } from "../types/index.js";
 import type { TransactionInsert } from "../schemas/transaction.js";
 
 // Create Supabase client with service role key (bypasses RLS)
@@ -21,10 +21,60 @@ export async function getUserByApiKey(apiKey: string): Promise<User | null> {
     return null;
   }
 
-  return { 
+  return {
     id: data.user_id,
     enable_review_mode: data.enable_review_mode,
   };
+}
+
+/**
+ * Read the Gmail Pub/Sub ingestion state for a user.
+ * Returns null if the user doesn't exist or no row matches.
+ */
+export async function getGmailWatchState(userId: string): Promise<GmailWatchState | null> {
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("gmail_last_history_id, gmail_watch_expires_at")
+    .eq("user_id", userId)
+    .single();
+
+  if (error || !data) {
+    console.error("Failed to get gmail watch state:", error?.message);
+    return null;
+  }
+
+  return {
+    userId,
+    lastHistoryId: data.gmail_last_history_id ?? null,
+    watchExpiresAt: data.gmail_watch_expires_at ? new Date(data.gmail_watch_expires_at) : null,
+  };
+}
+
+/**
+ * Update Gmail watch state. Pass only the fields you want to change.
+ *
+ * NOTE: `lastHistoryId` should ONLY advance forward. Callers (the Pub/Sub
+ * webhook) are expected to pass the historyId from the latest notification
+ * after they finish processing.
+ */
+export async function updateGmailWatchState(
+  userId: string,
+  patch: { lastHistoryId?: string; watchExpiresAt?: Date | null },
+): Promise<void> {
+  const update: Record<string, unknown> = {};
+  if (patch.lastHistoryId !== undefined) update.gmail_last_history_id = patch.lastHistoryId;
+  if (patch.watchExpiresAt !== undefined) {
+    update.gmail_watch_expires_at = patch.watchExpiresAt?.toISOString() ?? null;
+  }
+
+  const { error } = await supabase
+    .from("profiles")
+    .update(update)
+    .eq("user_id", userId);
+
+  if (error) {
+    throw new Error(`Failed to update gmail watch state: ${error.message}`);
+  }
 }
 
 /**

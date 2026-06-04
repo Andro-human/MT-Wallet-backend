@@ -3,6 +3,12 @@ export interface SMSMessage {
   sender: string;
   body: string;
   timestamp: string | null;
+  /**
+   * Email subject (Gmail path only). When present, Pass 1 (is-transaction
+   * classification) uses this instead of the body — a 5–20 token signal is
+   * plenty for "did money move?" judgement, vs hundreds for a body.
+   */
+  subject?: string;
 }
 
 export interface Category {
@@ -15,6 +21,12 @@ export interface User {
   id: string;
   email?: string;
   enable_review_mode?: boolean;
+}
+
+export interface GmailWatchState {
+  userId: string;
+  lastHistoryId: string | null;
+  watchExpiresAt: Date | null;
 }
 
 export interface UserMerchantMapping {
@@ -30,16 +42,6 @@ export interface UserMerchantMapping {
   date_operator: '<' | '>' | '<=' | '>=' | '=' | null;
   date_threshold: number | null;
   match_type: 'exact' | 'contains';
-}
-
-export interface IngestResponse {
-  success: boolean;
-  inserted: number;
-  skipped: number;
-  errors: number;
-  total: number;
-  details?: ParsedTransactionResult[];
-  run_id?: string;
 }
 
 export interface ParsedTransactionResult {
