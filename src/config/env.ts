@@ -55,6 +55,25 @@ export const env = {
 
   // Groq AI - optional fallback when Gemini fails
   groqApiKey: process.env.GROQ_API_KEY,
+
+  // Gmail Push (Pub/Sub) ingestion — all optional until the user completes
+  // the OAuth flow. Without GOOGLE_REFRESH_TOKEN the Gmail pipeline stays inert.
+  googleClientId: process.env.GOOGLE_CLIENT_ID,
+  googleClientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  googleRedirectUri: optionalEnv(
+    "GOOGLE_REDIRECT_URI",
+    "http://localhost:3001/api/auth/google/callback",
+  ),
+  googleRefreshToken: process.env.GOOGLE_REFRESH_TOKEN,
+  gmailLabelName: optionalEnv("GMAIL_LABEL_NAME", "Inbound-Wallet"),
+  gcpPubsubTopic: process.env.GCP_PUBSUB_TOPIC, // projects/<PROJECT_ID>/topics/<TOPIC>
+  // Single-user mode: api_key of the user this Gmail watch is associated with.
+  // We look up their profile row to read/write last_history_id and watch_expires_at.
+  gmailTargetUserApiKey: process.env.GMAIL_TARGET_USER_API_KEY,
+  // Optional: expected audience claim in the Pub/Sub push JWT. If unset, JWT
+  // verification is skipped (insecure — set this once the push subscription
+  // is configured with OIDC auth).
+  gcpPubsubPushAudience: process.env.GCP_PUBSUB_PUSH_AUDIENCE,
 } as const;
 
 console.log(`[env] Loaded: PORT=${env.port}, NODE_ENV=${env.nodeEnv}`);

@@ -291,9 +291,19 @@ async function callModelWithRetry<T extends z.ZodTypeAny>(
 
 const CLASSIFY_SYSTEM_PROMPT = `You classify Indian banking SMS messages as financial transactions or not. The per-field rules are in the schema descriptions; this prompt covers only the classification heuristic.
 
-A message is a transaction ONLY when it confirms money has ALREADY moved. Look for past-tense verbs: "debited", "credited", "spent", "received", "paid", "transferred", "withdrawn".
+A message IS a transaction when it describes a specific event of money moving. Look for past-tense verbs describing the event: "debited", "credited", "spent", "received", "paid", "transferred", "withdrawn", "used", "swiped", "charged".
 
-It is NOT a transaction when it is an OTP, payment authorization prompt, balance/statement notification, promotional offer, or anything with "pending"/"upcoming" wording — EVEN when an amount, merchant, or card is mentioned. OTPs typically say "OTP", "do not share", or "to verify/confirm" and authorize a FUTURE transaction; they are not transactions themselves.
+It is NOT a transaction when it is an OTP, payment authorization prompt, standalone balance/statement notification, promotional offer, or anything with "pending"/"upcoming"/"scheduled" wording — EVEN when an amount, merchant, or card is mentioned. OTPs typically say "OTP", "do not share", or "to verify/confirm" and authorize a FUTURE transaction; they are not transactions themselves.
+
+Output one object per input message in the same order. Copy sms_id EXACTLY from the corresponding input.`;
+
+const EMAIL_CLASSIFY_SYSTEM_PROMPT = `You classify emails as financial transactions. Each input has only the sender address and subject line.
+
+A message IS a transaction when BOTH:
+1. The sender is a recognised bank, card issuer, wallet, or payment service.
+2. The subject describes money that has ALREADY moved — past-tense / completion phrasing: "debited", "credited", "spent", "paid", "charged", "received Rs", "payment made", "transaction successful", "purchase", "withdrawal", "transferred", "card used".
+
+It is NOT a transaction when the subject is an OTP / verification code, a statement / balance update, a promotional offer or cashback (without describing a past payment), a pending / scheduled / EMI / reminder, a login or KYC alert, or marketing.
 
 Output one object per input message in the same order. Copy sms_id EXACTLY from the corresponding input.`;
 
@@ -301,18 +311,26 @@ async function classifyBatch(
   messages: SMSMessage[],
   usage: ModelUsage,
 ): Promise<{ classifications: z.infer<typeof ClassificationsArraySchema>; model: string }> {
-  const messagesForPrompt = messages.map((m) => ({
-    sms_id: m.id,
-    body: m.body,
-    sender: m.sender,
-  }));
+  // If every message in this batch carries a subject, it's an email batch
+  // (Gmail Pub/Sub path) — use the email-tuned prompt + {subject, sender} input.
+  // Otherwise it's an SMS batch — keep the original SMS prompt + {body, sender}
+  // input untouched. We never mix sources in the same batch today.
+  const isEmailBatch =
+    messages.length > 0 && messages.every((m) => m.subject && m.subject.trim());
+
+  const systemPrompt = isEmailBatch ? EMAIL_CLASSIFY_SYSTEM_PROMPT : CLASSIFY_SYSTEM_PROMPT;
+
+  const messagesForPrompt = isEmailBatch
+    ? messages.map((m) => ({ sms_id: m.id, subject: m.subject, sender: m.sender }))
+    : messages.map((m) => ({ sms_id: m.id, body: m.body, sender: m.sender }));
+
   const userPrompt = `INPUT MESSAGES:\n\`\`\`json\n${JSON.stringify(messagesForPrompt)}\n\`\`\``;
 
   try {
     const result = await callModelWithRetry(
       PRIMARY_PROVIDER,
       CLASSIFIER_MODEL,
-      CLASSIFY_SYSTEM_PROMPT,
+      systemPrompt,
       userPrompt,
       ClassificationsArraySchema,
     );
@@ -325,7 +343,7 @@ async function classifyBatch(
     const result = await callModelWithRetry(
       FALLBACK_PROVIDER,
       FALLBACK_MODEL,
-      CLASSIFY_SYSTEM_PROMPT,
+      systemPrompt,
       userPrompt,
       ClassificationsArraySchema,
     );

@@ -33,6 +33,8 @@ async function main() {
     { default: smsRoutes },
     { default: importRoutes },
     { default: syncRunsRoutes },
+    gmailService,
+    supabaseService,
   ] = await Promise.all([
     import("express"),
     import("cors"),
@@ -40,6 +42,8 @@ async function main() {
     import("./routes/sms.js"),
     import("./routes/import.js"),
     import("./routes/sync-runs.js"),
+    import("./services/gmail.js"),
+    import("./services/supabase.js"),
   ]);
 
   console.log("[startup] All modules loaded successfully.");
@@ -97,6 +101,43 @@ async function main() {
     console.error("Server failed to start:", err);
     process.exit(1);
   });
+
+  // ── Gmail Pub/Sub watch lifecycle ──────────────────────────────────────────
+  // Lease lasts max 7 days. Renew every 24h on a setInterval (cheap, idempotent).
+  // First call on startup establishes the cursor if not already set; subsequent
+  // calls just refresh the expiration.
+  const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+  async function ensureGmailWatch() {
+    if (!gmailService.isGmailFullyAuthed()) {
+      console.log("[Gmail] Watch skipped — Gmail not fully configured (missing client/secret/refresh_token)");
+      return;
+    }
+    if (!env.gmailTargetUserApiKey) {
+      console.log("[Gmail] Watch skipped — GMAIL_TARGET_USER_API_KEY not set");
+      return;
+    }
+    try {
+      const user = await supabaseService.getUserByApiKey(env.gmailTargetUserApiKey);
+      if (!user) {
+        console.error("[Gmail] Watch failed — no user matches GMAIL_TARGET_USER_API_KEY");
+        return;
+      }
+      const result = await gmailService.startOrRenewWatch(user.id);
+      console.log(
+        `[Gmail] Watch active — historyId=${result.historyId} expiresAt=${result.expiresAt.toISOString()}`
+      );
+    } catch (err) {
+      // Don't crash the server on Gmail failures — log and continue. Common
+      // causes: refresh token revoked, label missing, topic IAM not set.
+      console.error("[Gmail] startOrRenewWatch failed:", (err as Error).message);
+    }
+  }
+
+  // Kick off the first watch shortly after startup (don't block server listen).
+  setTimeout(() => { void ensureGmailWatch(); }, 2000);
+  // Renew every 24h thereafter. Setting unref so it doesn't keep the process alive in tests.
+  setInterval(() => { void ensureGmailWatch(); }, ONE_DAY_MS).unref();
 }
 
 main().catch((err) => {
