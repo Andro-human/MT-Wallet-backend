@@ -2,6 +2,12 @@ import { createClient } from "@supabase/supabase-js";
 import { env } from "../config/env.js";
 import type { Category, GmailWatchState, User, ParsedTransactionResult, SMSMessage, UserMerchantMapping } from "../types/index.js";
 import type { TransactionInsert } from "../schemas/transaction.js";
+import {
+  CROSS_CHANNEL_WINDOW_MS,
+  matchesExistingCrossChannelRow,
+  type CrossChannelCandidate,
+  type ExistingTransactionRow,
+} from "./deduplication.js";
 
 // Create Supabase client with service role key (bypasses RLS)
 export const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey);
@@ -132,6 +138,69 @@ export function getCategoryIdBySlug(
   );
 
   return category?.id || null;
+}
+
+/**
+ * Layer 1: find an existing row with the same bank reference id + direction.
+ * Direction is part of the key because some banks reuse the same UPI Ref for
+ * the original debit and its reversal (credit) — both are legitimate rows.
+ */
+export async function findTransactionByReferenceId(
+  userId: string,
+  referenceId: string,
+  direction: "credit" | "debit",
+): Promise<{ id: string } | null> {
+  const { data, error } = await supabase
+    .from("transactions")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("reference_id", referenceId)
+    .eq("direction", direction)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Failed to look up transaction by reference_id:", error.message);
+    return null;
+  }
+
+  return data ? { id: data.id } : null;
+}
+
+/**
+ * Layer 2a: find a phone↔email duplicate in the recent window.
+ * Caller must ensure candidate has non-null account_last4 and bank_name.
+ */
+export async function findCrossChannelDuplicate(
+  userId: string,
+  candidate: CrossChannelCandidate,
+): Promise<{ id: string } | null> {
+  const center = new Date(candidate.transacted_at).getTime();
+  const from = new Date(center - CROSS_CHANNEL_WINDOW_MS).toISOString();
+  const to = new Date(center + CROSS_CHANNEL_WINDOW_MS).toISOString();
+
+  const { data, error } = await supabase
+    .from("transactions")
+    .select("id, amount, direction, account_last4, bank_name, source, transacted_at")
+    .eq("user_id", userId)
+    .eq("amount", candidate.amount)
+    .eq("direction", candidate.direction)
+    .eq("account_last4", candidate.account_last4!)
+    .gte("transacted_at", from)
+    .lte("transacted_at", to);
+
+  if (error) {
+    console.error("Failed to look up cross-channel duplicate:", error.message);
+    return null;
+  }
+
+  for (const row of (data || []) as ExistingTransactionRow[]) {
+    if (matchesExistingCrossChannelRow(candidate, row)) {
+      return { id: row.id };
+    }
+  }
+
+  return null;
 }
 
 /**

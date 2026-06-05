@@ -43,7 +43,7 @@ const TransactionOutputSchema = z.object({
     .string()
     .nullable()
     .optional()
-    .describe("Transaction reference or UPI ref number"),
+    .describe("Per-transaction bank ref (UPI Ref / RRN / Txn ID / IMPS Ref). Null if only a mandate / Standing Instruction / order / customer ID is present — those aren't transaction refs."),
   category_slug: z
     .string()
     .nullable()
@@ -95,7 +95,7 @@ const ExtractedFieldsSchema = z.object({
   reference_id: z
     .string()
     .nullable()
-    .describe("Transaction reference or UPI ref number."),
+    .describe("Per-transaction bank ref (UPI Ref / RRN / Txn ID / IMPS Ref). Null if only a mandate / Standing Instruction / order / customer ID is present."),
   category_slug: z
     .string()
     .nullable()
@@ -289,39 +289,51 @@ async function callModelWithRetry<T extends z.ZodTypeAny>(
 
 // ── Pass 1: classify ───────────────────────────────────────────────────────
 
-const CLASSIFY_SYSTEM_PROMPT = `You classify Indian banking SMS messages as financial transactions or not. The per-field rules are in the schema descriptions; this prompt covers only the classification heuristic.
+const CLASSIFY_SYSTEM_PROMPT = `You classify Indian banking SMS as financial transactions.
 
-A message IS a transaction when it describes a specific event of money moving. Look for past-tense verbs describing the event: "debited", "credited", "spent", "received", "paid", "transferred", "withdrawn", "used", "swiped", "charged".
+YES: past-tense verb describing money moving — debited, credited, spent, received, paid, transferred, withdrawn, used, swiped, charged.
 
-It is NOT a transaction when it is an OTP, payment authorization prompt, standalone balance/statement notification, promotional offer, or anything with "pending"/"upcoming"/"scheduled" wording — EVEN when an amount, merchant, or card is mentioned. OTPs typically say "OTP", "do not share", or "to verify/confirm" and authorize a FUTURE transaction; they are not transactions themselves.
+NO: OTP / verification, payment authorization, standalone balance / statement, promo, pending / upcoming / scheduled — even if an amount, merchant, or card is mentioned.
 
-Output one object per input message in the same order. Copy sms_id EXACTLY from the corresponding input.`;
+Output one object per input, same order. Copy sms_id EXACTLY.`;
 
-const EMAIL_CLASSIFY_SYSTEM_PROMPT = `You classify emails as financial transactions. Each input has only the sender address and subject line.
+const EMAIL_CLASSIFY_SYSTEM_PROMPT = `You classify emails as financial transactions. Each input has sender, subject, body_preview.
 
-A message IS a transaction when BOTH:
-1. The sender is a recognised bank, card issuer, wallet, or payment service.
-2. The subject describes money that has ALREADY moved — past-tense / completion phrasing: "debited", "credited", "spent", "paid", "charged", "received Rs", "payment made", "transaction successful", "purchase", "withdrawal", "transferred", "card used".
+YES when BOTH:
+1. Sender is a bank / card / wallet / payment service.
+2. Subject OR body_preview shows past-tense money movement: debited, credited, spent, paid, charged, received, withdrawn, transferred, "card used", "payment made", "transaction successful".
 
-It is NOT a transaction when the subject is an OTP / verification code, a statement / balance update, a promotional offer or cashback (without describing a past payment), a pending / scheduled / EMI / reminder, a login or KYC alert, or marketing.
+For vague subjects (e.g. "Transaction Alert", "Notification", "Card Update"), use body_preview — amount + past-tense verb = YES.
 
-Output one object per input message in the same order. Copy sms_id EXACTLY from the corresponding input.`;
+NO: OTP / verification, statement / balance update, promo / cashback, pending / scheduled / EMI reminder, login / KYC alert, marketing.
+
+Output one object per input, same order. Copy sms_id EXACTLY.`;
+
+// First N chars of body fed to email Pass 1 to disambiguate vague subjects.
+// Most banks front-load the "Rs.X spent/debited/credited" line within the first
+// 150-200 chars; longer is mostly noise.
+const EMAIL_BODY_PREVIEW_CHARS = 200;
 
 async function classifyBatch(
   messages: SMSMessage[],
   usage: ModelUsage,
 ): Promise<{ classifications: z.infer<typeof ClassificationsArraySchema>; model: string }> {
   // If every message in this batch carries a subject, it's an email batch
-  // (Gmail Pub/Sub path) — use the email-tuned prompt + {subject, sender} input.
-  // Otherwise it's an SMS batch — keep the original SMS prompt + {body, sender}
-  // input untouched. We never mix sources in the same batch today.
+  // (Gmail Pub/Sub path) — use the email-tuned prompt + {subject, sender,
+  // body_preview} input. Otherwise it's an SMS batch — keep the original SMS
+  // prompt + {body, sender} input untouched. We never mix sources in the same batch today.
   const isEmailBatch =
     messages.length > 0 && messages.every((m) => m.subject && m.subject.trim());
 
   const systemPrompt = isEmailBatch ? EMAIL_CLASSIFY_SYSTEM_PROMPT : CLASSIFY_SYSTEM_PROMPT;
 
   const messagesForPrompt = isEmailBatch
-    ? messages.map((m) => ({ sms_id: m.id, subject: m.subject, sender: m.sender }))
+    ? messages.map((m) => ({
+        sms_id: m.id,
+        subject: m.subject,
+        sender: m.sender,
+        body_preview: (m.body || "").slice(0, EMAIL_BODY_PREVIEW_CHARS),
+      }))
     : messages.map((m) => ({ sms_id: m.id, body: m.body, sender: m.sender }));
 
   const userPrompt = `INPUT MESSAGES:\n\`\`\`json\n${JSON.stringify(messagesForPrompt)}\n\`\`\``;
@@ -356,15 +368,15 @@ async function classifyBatch(
 
 function buildExtractBatchPrompt(categories: Category[]): string {
   const categoryList = categories.map((c) => c.slug).join(", ");
-  return `You extract transaction fields from Indian banking SMS messages. The caller has already classified each input as a financial transaction; do not re-classify, do not refuse. Per-field guidance is in the schema descriptions.
+  return `Extract transaction fields from Indian banking SMS. Each input is already confirmed a transaction — don't re-classify, don't refuse.
 
-Extract fields ONLY when clearly present. If a field is not clearly stated, return null — do NOT guess, infer, or invent values. Null is the correct answer when you are uncertain.
+Return null for any field not clearly stated. Don't guess or infer.
 
-amount trap: ignore "Available Balance" and "Avl Limit" — those are balance, not the transaction amount.
+amount trap: "Available Balance" / "Avl Limit" are balance, NOT the transaction amount.
 
-category_slug: best fit from [${categoryList}]. Use "other" only when a category is clearly required but no specific one fits.
+category_slug: best fit from [${categoryList}]. Use "other" only when nothing else fits.
 
-Output one object per input message in the same order. Copy sms_id EXACTLY from the corresponding input.`;
+Output one object per input, same order. Copy sms_id EXACTLY.`;
 }
 
 async function extractBatch(
@@ -420,13 +432,13 @@ export async function extractTransactionFields(
 ): Promise<{ fields: ExtractedFields; model: string }> {
   const categoryList = categories.map((c) => c.slug).join(", ");
 
-  const systemPrompt = `You extract transaction fields from a single banking SMS. The caller has already decided this SMS is a transaction; do not re-classify, do not refuse. Per-field guidance is in the schema descriptions.
+  const systemPrompt = `Extract transaction fields from a banking SMS. Already confirmed a transaction — don't re-classify, don't refuse.
 
-Extract fields ONLY when clearly present. If a field is not clearly stated, return null — do NOT guess, infer, or invent values. Null is the correct answer when you are uncertain.
+Return null for any field not clearly stated. Don't guess or infer.
 
-amount trap: ignore "Available Balance" and "Avl Limit" — those are balance, not the transaction amount.
+amount trap: "Available Balance" / "Avl Limit" are balance, NOT the transaction amount.
 
-category_slug: best fit from [${categoryList}]. Use "other" only when a category is clearly required but no specific one fits.`;
+category_slug: best fit from [${categoryList}]. Use "other" only when nothing else fits.`;
 
   const userPrompt = `SMS sender: ${message.sender}
 SMS body:

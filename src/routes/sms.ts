@@ -9,7 +9,14 @@ import {
   getUserMerchantMappings,
   getGmailWatchState,
   updateGmailWatchState,
+  findTransactionByReferenceId,
+  findCrossChannelDuplicate,
 } from "../services/supabase.js";
+import {
+  findInBatchCrossChannelDuplicate,
+  findInBatchReferenceIdDuplicate,
+} from "../services/deduplication.js";
+import { withUserIngestLock } from "../services/ingest-lock.js";
 import { convertToINR, isForeignCurrency } from "../services/currency.js";
 import {
   cleanEmailBody,
@@ -18,6 +25,7 @@ import {
   isGmailFullyAuthed,
   verifyPubSubJWT,
 } from "../services/gmail.js";
+import { nullifyStringy } from "../services/sanitize.js";
 import type { ParsedTransactionResult, SMSMessage, User } from "../types/index.js";
 import type { TransactionInsert } from "../schemas/transaction.js";
 import { env } from "../config/env.js";
@@ -135,6 +143,23 @@ async function processMessagesInBackground(
     body: string;
     timestamp?: string;
     /** Email subject — Pass 1 uses this instead of body when present. */
+    subject?: string;
+  }[],
+  source: "ios_shortcut" | "email",
+  startTime: number,
+  logPrefix: string,
+): Promise<void> {
+  return withUserIngestLock(user.id, () =>
+    processMessagesInBackgroundUnlocked(user, rawMessages, source, startTime, logPrefix),
+  );
+}
+
+async function processMessagesInBackgroundUnlocked(
+  user: User,
+  rawMessages: {
+    sender: string;
+    body: string;
+    timestamp?: string;
     subject?: string;
   }[],
   source: "ios_shortcut" | "email",
@@ -380,16 +405,17 @@ async function processMessagesInBackground(
       if (overriddenIsIncome !== null) is_income = overriddenIsIncome;
 
       // Prepare transaction for insert
-      const transactionData = {
+      const cleanedMerchant = nullifyStringy(finalMerchant);
+      const transactionData: TransactionInsert = {
         user_id: user.id,
         amount: amountINR,
         direction: txn.direction,
         transacted_at: msg.timestamp,
-        merchant: finalMerchant,
-        merchant_normalized: finalMerchant,
-        account_last4: txn.account_last4 || null,
-        bank_name: txn.bank_name || null,
-        reference_id: txn.reference_id || null,
+        merchant: cleanedMerchant,
+        merchant_normalized: cleanedMerchant,
+        account_last4: nullifyStringy(txn.account_last4),
+        bank_name: nullifyStringy(txn.bank_name),
+        reference_id: nullifyStringy(txn.reference_id),
         raw_sms: msg.body,
         sms_id: msg.id,
         sms_sender: msg.sender,
@@ -402,18 +428,80 @@ async function processMessagesInBackground(
         needs_review: user.enable_review_mode ?? true,
       };
 
+      const parsedSummary = {
+        amount: txn.amount,
+        direction: txn.direction,
+        merchant: nullifyStringy(txn.merchant),
+        category: nullifyStringy(txn.category_slug),
+      };
+
+      // Layer 1: strong key (reference_id)
+      if (transactionData.reference_id) {
+        if (findInBatchReferenceIdDuplicate(transactionData.reference_id, transactionData.direction, transactionsToInsert)) {
+          skipped++;
+          details.push({
+            sms_id: msg.id,
+            status: "skipped",
+            ai_model: aiModelUsed,
+            reason: "Duplicate reference_id (same batch)",
+            transaction: parsedSummary,
+          });
+          continue;
+        }
+
+        const existingRef = await findTransactionByReferenceId(
+          user.id,
+          transactionData.reference_id,
+          transactionData.direction,
+        );
+        if (existingRef) {
+          skipped++;
+          details.push({
+            sms_id: msg.id,
+            status: "skipped",
+            ai_model: aiModelUsed,
+            reason: "Duplicate reference_id",
+            transaction: parsedSummary,
+          });
+          continue;
+        }
+      }
+
+      // Layer 2a: cross-channel soft fingerprint (phone ↔ email, 30 min)
+      if (transactionData.account_last4 && transactionData.bank_name) {
+        if (findInBatchCrossChannelDuplicate(transactionData, transactionsToInsert)) {
+          skipped++;
+          details.push({
+            sms_id: msg.id,
+            status: "skipped",
+            ai_model: aiModelUsed,
+            reason: "Cross-channel duplicate (same batch)",
+            transaction: parsedSummary,
+          });
+          continue;
+        }
+
+        const crossChannel = await findCrossChannelDuplicate(user.id, transactionData);
+        if (crossChannel) {
+          skipped++;
+          details.push({
+            sms_id: msg.id,
+            status: "skipped",
+            ai_model: aiModelUsed,
+            reason: "Cross-channel duplicate (phone/email)",
+            transaction: parsedSummary,
+          });
+          continue;
+        }
+      }
+
       transactionsToInsert.push(transactionData);
 
       details.push({
         sms_id: msg.id,
         status: "inserted",
         ai_model: aiModelUsed,
-        transaction: {
-          amount: txn.amount,
-          direction: txn.direction,
-          merchant: txn.merchant || null,
-          category: txn.category_slug || null,
-        },
+        transaction: parsedSummary,
       });
     }
 
