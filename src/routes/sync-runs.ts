@@ -9,6 +9,7 @@ import {
   updateSyncRunDetail,
 } from "../services/supabase.js";
 import { extractTransactionFields } from "../services/ai.js";
+import { nullifyStringy } from "../services/sanitize.js";
 
 const router = Router();
 
@@ -152,15 +153,16 @@ router.post(
       ? categoryMap.get(fields.category_slug.toLowerCase()) ?? null
       : null;
 
+    const cleanedMerchant = nullifyStringy(fields.merchant);
     const insertRes = await insertTransaction({
       user_id: user.id,
       amount: fields.amount,
       direction: fields.direction,
       transacted_at: fields.transacted_at || sms.timestamp || new Date().toISOString(),
-      merchant: fields.merchant ?? null,
-      merchant_normalized: fields.merchant ?? null,
-      account_last4: fields.account_last4 ?? null,
-      bank_name: fields.bank_name ?? null,
+      merchant: cleanedMerchant,
+      merchant_normalized: cleanedMerchant,
+      account_last4: nullifyStringy(fields.account_last4),
+      bank_name: nullifyStringy(fields.bank_name),
       reference_id: null,
       raw_sms: sms.body,
       sms_id: smsId,
@@ -194,7 +196,7 @@ router.post(
         transaction: {
           amount: fields.amount,
           direction: fields.direction,
-          merchant: fields.merchant ?? null,
+          merchant: cleanedMerchant,
           category: categorySlugForDetail,
         },
       },
