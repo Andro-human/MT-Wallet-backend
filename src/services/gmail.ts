@@ -86,43 +86,40 @@ function stripHtml(html: string): string {
     .trim();
 }
 
+// Some senders (Amazon Pay, marketing platforms) include a stub text/plain
+// part like "Default email text body" with the real content only in text/html.
+// We treat any text/plain shorter than this as "stub" and prefer html instead.
+const MIN_PLAINTEXT_CHARS = 120;
+
 /**
- * Walk a MIME tree, return decoded plain text. Prefers text/plain; recurses
- * into multipart wrappers; falls back to crude HTML strip on text/html when
- * no plain text exists. Returns "" if nothing usable found.
+ * Walk a MIME tree, return decoded plain text. Prefers text/plain when it's
+ * substantive (> MIN_PLAINTEXT_CHARS); otherwise falls back to crude HTML
+ * strip on text/html. Returns "" if nothing usable found.
  */
 function extractPlainTextBody(payload: gmail_v1.Schema$MessagePart | null | undefined): string {
   if (!payload) return "";
 
-  if (payload.mimeType === "text/plain" && payload.body?.data) {
-    return base64UrlDecode(payload.body.data);
-  }
+  // Collect both plain and html text from the tree, prefer whichever is more substantive.
+  const plain: string[] = [];
+  const html: string[] = [];
 
-  const parts = payload.parts ?? [];
-  if (parts.length > 0) {
-    for (const part of parts) {
-      if (part.mimeType === "text/plain" && part.body?.data) {
-        return base64UrlDecode(part.body.data);
-      }
+  const walk = (node: gmail_v1.Schema$MessagePart): void => {
+    if (node.mimeType === "text/plain" && node.body?.data) {
+      plain.push(base64UrlDecode(node.body.data));
+    } else if (node.mimeType === "text/html" && node.body?.data) {
+      html.push(stripHtml(base64UrlDecode(node.body.data)));
     }
-    for (const part of parts) {
-      if (part.parts?.length) {
-        const inner = extractPlainTextBody(part);
-        if (inner) return inner;
-      }
-    }
-    for (const part of parts) {
-      if (part.mimeType === "text/html" && part.body?.data) {
-        return stripHtml(base64UrlDecode(part.body.data));
-      }
-    }
-  }
+    for (const child of node.parts ?? []) walk(child);
+  };
+  walk(payload);
 
-  if (payload.mimeType === "text/html" && payload.body?.data) {
-    return stripHtml(base64UrlDecode(payload.body.data));
-  }
+  const plainText = plain.join("\n").trim();
+  if (plainText.length >= MIN_PLAINTEXT_CHARS) return plainText;
 
-  return "";
+  const htmlText = html.join("\n").trim();
+  if (htmlText) return htmlText;
+
+  return plainText; // last resort — even a stub is better than nothing
 }
 
 /**
