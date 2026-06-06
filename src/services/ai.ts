@@ -91,7 +91,7 @@ const ExtractedFieldsSchema = z.object({
   bank_name: z
     .string()
     .nullable()
-    .describe("Bank name."),
+    .describe("Bank OR wallet / payment-app provider. Decode common abbreviations: 'Apay'/'Apay balance' = Amazon Pay, 'Paytm' = Paytm, 'PhonePe' = PhonePe, 'GPay' = Google Pay, 'Mobikwik' = Mobikwik."),
   reference_id: z
     .string()
     .nullable()
