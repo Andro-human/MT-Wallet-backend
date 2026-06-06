@@ -301,11 +301,11 @@ const EMAIL_CLASSIFY_SYSTEM_PROMPT = `You classify emails as financial transacti
 
 YES when BOTH:
 1. Sender is a bank / card / wallet / payment service.
-2. Subject OR body_preview shows past-tense money movement: debited, credited, spent, paid, charged, received, withdrawn, transferred, "card used", "payment made", "transaction successful".
+2. Subject OR body_preview shows past-tense money movement: debited, credited, spent, paid, charged, received, withdrawn, transferred, refunded, reversed, "card used", "payment made", "transaction successful", "refund processed".
 
 For vague subjects (e.g. "Transaction Alert", "Notification", "Card Update"), use body_preview — amount + past-tense verb = YES.
 
-NO: OTP / verification, statement / balance update, promo / cashback, pending / scheduled / EMI reminder, login / KYC alert, marketing.
+NO: OTP / verification, statement / balance update, promo / cashback (without an actual payment), pending / scheduled / EMI reminder, login / KYC alert, marketing.
 
 Output one object per input, same order. Copy sms_id EXACTLY.`;
 
