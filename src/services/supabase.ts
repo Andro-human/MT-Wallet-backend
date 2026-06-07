@@ -320,9 +320,23 @@ export async function updateSyncRunDetail(params: {
     else if (d.status === "error") errors++;
   }
 
+  const totalMsgs = inserted + skipped + errors;
+  const newStatus =
+    totalMsgs === 0 ? "no_messages" :
+    errors > 0 && inserted === 0 ? "failed" :
+    errors > 0 ? "partial" :
+    "success";
+
   const { error: updateErr } = await supabase
     .from("sync_runs")
-    .update({ details, inserted, skipped, errors })
+    .update({
+      details,
+      inserted,
+      skipped,
+      errors,
+      status: newStatus,
+      total_messages: totalMsgs,
+    })
     .eq("id", params.runId)
     .eq("user_id", params.userId);
   if (updateErr) {
