@@ -160,7 +160,6 @@ router.post(
       direction: fields.direction,
       transacted_at: fields.transacted_at || sms.timestamp || new Date().toISOString(),
       merchant: cleanedMerchant,
-      merchant_normalized: cleanedMerchant,
       account_last4: nullifyStringy(fields.account_last4),
       bank_name: nullifyStringy(fields.bank_name),
       reference_id: null,

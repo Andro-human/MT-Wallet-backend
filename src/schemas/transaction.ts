@@ -7,7 +7,6 @@ export const TransactionInsertSchema = z.object({
   direction: z.enum(["credit", "debit"]),
   transacted_at: z.string().datetime(),
   merchant: z.string().nullable(),
-  merchant_normalized: z.string().nullable(),
   account_last4: z.string().nullable(),
   bank_name: z.string().nullable(),
   reference_id: z.string().nullable(),

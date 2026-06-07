@@ -200,7 +200,6 @@ router.post("/axio", async (req: Request, res: Response) => {
       direction,
       transacted_at,
       merchant: row.place.trim() || null,
-      merchant_normalized: row.place.trim() || null,
       account_last4,
       bank_name,
       reference_id: null,

@@ -357,6 +357,7 @@ async function processMessagesInBackgroundUnlocked(
 
       let overriddenIsExpense: boolean | null = null;
       let overriddenIsIncome: boolean | null = null;
+      let mappingApplied = false;
 
       if (finalMerchant) {
         let matchedRule: typeof userOverrides[0] | null = null;
@@ -371,6 +372,7 @@ async function processMessagesInBackgroundUnlocked(
         if (matchedRule) {
           console.log(`${logPrefix} [Override] Re-mapped merchant "${finalMerchant}" → "${matchedRule.mapped_merchant}"`);
           finalMerchant = matchedRule.mapped_merchant;
+          mappingApplied = true;
 
           if (matchedRule.default_category_id) {
             finalCategoryId = matchedRule.default_category_id;
@@ -382,6 +384,10 @@ async function processMessagesInBackgroundUnlocked(
             overriddenIsIncome = matchedRule.default_is_income;
           }
         }
+      }
+
+      if (!mappingApplied && finalMerchant) {
+        finalMerchant = finalMerchant.toLowerCase().trim();
       }
 
       // Deterministic is_expense / is_income rules
@@ -412,7 +418,6 @@ async function processMessagesInBackgroundUnlocked(
         direction: txn.direction,
         transacted_at: msg.timestamp,
         merchant: cleanedMerchant,
-        merchant_normalized: cleanedMerchant,
         account_last4: nullifyStringy(txn.account_last4),
         bank_name: nullifyStringy(txn.bank_name),
         reference_id: nullifyStringy(txn.reference_id),
