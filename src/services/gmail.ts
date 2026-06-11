@@ -76,12 +76,39 @@ function base64UrlDecode(data: string): string {
   return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
 }
 
+// Senders pad the inbox preview snippet with runs of invisible Unicode chars
+// ("preheader padding"); left in place they consume the AI truncation window.
+// Strips zero-width/combining marks, normalizes Unicode spaces to ASCII space.
+function stripInvisibleAndNormalizeSpaces(text: string): string {
+  return text
+    .replace(/[\u00AD\u034F\u200B-\u200F\u2060\uFEFF]/g, "")
+    .replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
+}
+
+// Entities must decode before the invisible-strip pass (preheader padding is
+// often entity-encoded in the html part). &amp; decodes last: &amp;#8199;
+// must yield the string "&#8199;", not the char.
+const NAMED_ENTITIES: Record<string, string> = {
+  nbsp: " ", shy: "­", zwnj: "‌", zwj: "‍",
+  lt: "<", gt: ">", quot: '"', apos: "'",
+};
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&(nbsp|shy|zwnj|zwj|lt|gt|quot|apos);/g, (_, name) => NAMED_ENTITIES[name])
+    .replace(/&amp;/g, "&");
+}
+
 function stripHtml(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
+  return stripInvisibleAndNormalizeSpaces(
+    decodeHtmlEntities(
+      html
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<[^>]+>/g, " "),
+    ),
+  )
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -113,7 +140,8 @@ function extractPlainTextBody(payload: gmail_v1.Schema$MessagePart | null | unde
   };
   walk(payload);
 
-  const plainText = plain.join("\n").trim();
+  // Normalize before the length gate — invisible padding would inflate it.
+  const plainText = stripInvisibleAndNormalizeSpaces(plain.join("\n")).trim();
   if (plainText.length >= MIN_PLAINTEXT_CHARS) return plainText;
 
   const htmlText = html.join("\n").trim();
@@ -162,7 +190,7 @@ type FetchedGmailMessage = {
  */
 const DEFAULT_AI_BODY_CHARS = 500;
 export function cleanEmailBody(text: string, maxChars: number = DEFAULT_AI_BODY_CHARS): string {
-  const cleaned = text
+  const cleaned = stripInvisibleAndNormalizeSpaces(text)
     .replace(/https?:\/\/[^\s)>]+/g, "[link]")
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
@@ -215,26 +243,35 @@ export async function fetchNewMessagesSinceHistoryId(
 
   if (messageIds.length === 0) return [];
 
+  // Per-message try/catch: a throw here makes the caller reset the history
+  // cursor, dropping every other email in the range.
   const out: FetchedGmailMessage[] = [];
   for (const id of messageIds) {
-    const msgRes = await gmail.users.messages.get({ userId: "me", id, format: "full" });
-    const msg = msgRes.data;
+    try {
+      const msgRes = await gmail.users.messages.get({ userId: "me", id, format: "full" });
+      const msg = msgRes.data;
 
-    // The history record can include messages whose label was later removed.
-    // Re-check current label membership before processing.
-    if (!msg.labelIds?.includes(labelId)) {
-      console.log(`[Gmail] Skipping ${id} — label no longer present on message`);
-      continue;
+      // The history record can include messages whose label was later removed.
+      // Re-check current label membership before processing.
+      if (!msg.labelIds?.includes(labelId)) {
+        console.log(`[Gmail] Skipping ${id} — label no longer present on message`);
+        continue;
+      }
+
+      const headers = msg.payload?.headers ?? [];
+      const fromHeader = headers.find((h) => h.name?.toLowerCase() === "from")?.value ?? "Unknown";
+      const subjectHeader = headers.find((h) => h.name?.toLowerCase() === "subject")?.value ?? "";
+      const dateHeader = headers.find((h) => h.name?.toLowerCase() === "date")?.value;
+      const body = extractPlainTextBody(msg.payload) || msg.snippet || "";
+      const parsedDate = dateHeader ? new Date(dateHeader) : new Date();
+      const timestamp = isNaN(parsedDate.getTime())
+        ? new Date().toISOString()
+        : parsedDate.toISOString();
+
+      out.push({ gmailMessageId: id, sender: fromHeader, subject: subjectHeader, body, timestamp });
+    } catch (err) {
+      console.error(`[Gmail] Failed to fetch/parse message ${id} — skipping:`, (err as Error).message);
     }
-
-    const headers = msg.payload?.headers ?? [];
-    const fromHeader = headers.find((h) => h.name?.toLowerCase() === "from")?.value ?? "Unknown";
-    const subjectHeader = headers.find((h) => h.name?.toLowerCase() === "subject")?.value ?? "";
-    const dateHeader = headers.find((h) => h.name?.toLowerCase() === "date")?.value;
-    const body = extractPlainTextBody(msg.payload) || msg.snippet || "";
-    const timestamp = dateHeader ? new Date(dateHeader).toISOString() : new Date().toISOString();
-
-    out.push({ gmailMessageId: id, sender: fromHeader, subject: subjectHeader, body, timestamp });
   }
 
   return out;
