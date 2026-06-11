@@ -192,7 +192,9 @@ const DEFAULT_AI_BODY_CHARS = 500;
 export function cleanEmailBody(text: string, maxChars: number = DEFAULT_AI_BODY_CHARS): string {
   const cleaned = stripInvisibleAndNormalizeSpaces(text)
     .replace(/https?:\/\/[^\s)>]+/g, "[link]")
+    .replace(/\r\n?/g, "\n")
     .replace(/[ \t]+/g, " ")
+    .replace(/ +\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
   return cleaned.length > maxChars
