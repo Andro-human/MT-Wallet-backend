@@ -741,12 +741,9 @@ router.post("/pubsub-ingest", async (req: Request, res: Response) => {
       try {
         fetched = await fetchNewMessagesSinceHistoryId(state.lastHistoryId, labelId);
       } catch (err) {
-        // history.list returns 404 only when the cursor is too old (>7 days
-        // idle) — that's the one case where resetting forward is correct.
-        // On transient errors (network, 5xx) the cursor must stay put: we
-        // already ACKed Pub/Sub so there's no redelivery, and the next
-        // notification re-fetches the same range. Resetting on a transient
-        // error would silently drop every email in the range.
+        // Reset the cursor only on 404 (cursor too old). On transient errors
+        // it must stay put — Pub/Sub was already ACKed so there's no
+        // redelivery; the next notification re-fetches the same range.
         const status = (err as { response?: { status?: number }; code?: number | string }).response?.status
           ?? (err as { code?: number | string }).code;
         const msg = (err as Error).message || String(err);

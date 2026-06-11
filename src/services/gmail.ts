@@ -76,29 +76,18 @@ function base64UrlDecode(data: string): string {
   return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
 }
 
-// Defang "preheader padding": senders (Airbnb, Mailchimp templates, etc.) pad
-// the inbox snippet with sequences of invisible Unicode chars so the preview
-// blurb extends further than the visible content. Left alone, this padding
-// blows past our truncation window before the LLM sees the real body.
-//
-// First pass strips zero-width / combining marks that have no visible width.
-// Second pass normalizes Unicode space-like chars (figure space, nbsp,
-// ideographic space, etc.) to ASCII space so the later collapse can fold them.
+// Senders pad the inbox preview snippet with runs of invisible Unicode chars
+// ("preheader padding"); left in place they consume the AI truncation window.
+// Strips zero-width/combining marks, normalizes Unicode spaces to ASCII space.
 function stripInvisibleAndNormalizeSpaces(text: string): string {
-  // Strip zero-width / combining marks: soft hyphen, combining grapheme joiner,
-  // zero-width space family (ZWSP, ZWNJ, ZWJ, LRM, RLM), word joiner, BOM.
-  // Then normalize Unicode space-likes (nbsp, en/em space, figure space,
-  // ideographic space, etc.) to ASCII space.
   return text
     .replace(/[\u00AD\u034F\u200B-\u200F\u2060\uFEFF]/g, "")
     .replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
 }
 
-// Decode HTML entities to their Unicode chars so the invisible-strip pass can
-// see them. Senders encode preheader padding as numeric entities in the HTML
-// part (&#8199;&#847; = figure space + CGJ) — a regex tag-strip leaves those
-// as literal ASCII junk. &amp; is decoded last to avoid double-decoding
-// (&amp;#8199; must become "&#8199;" the string, not the char).
+// Entities must decode before the invisible-strip pass (preheader padding is
+// often entity-encoded in the html part). &amp; decodes last: &amp;#8199;
+// must yield the string "&#8199;", not the char.
 const NAMED_ENTITIES: Record<string, string> = {
   nbsp: " ", shy: "­", zwnj: "‌", zwj: "‍",
   lt: "<", gt: ">", quot: '"', apos: "'",
@@ -151,9 +140,7 @@ function extractPlainTextBody(payload: gmail_v1.Schema$MessagePart | null | unde
   };
   walk(payload);
 
-  // Normalize before measuring: preheader-padding senders inflate plainText.length
-  // with invisible Unicode chars, which would falsely pass the 120-char gate and
-  // hide the substantive content that's only in text/html.
+  // Normalize before the length gate — invisible padding would inflate it.
   const plainText = stripInvisibleAndNormalizeSpaces(plain.join("\n")).trim();
   if (plainText.length >= MIN_PLAINTEXT_CHARS) return plainText;
 
@@ -256,10 +243,8 @@ export async function fetchNewMessagesSinceHistoryId(
 
   if (messageIds.length === 0) return [];
 
-  // Each message is fetched in its own try/catch: one deleted message (404
-  // from messages.get) or one malformed header must not abort the batch —
-  // the caller resets the history cursor on throw, which would silently
-  // drop every other email in the range.
+  // Per-message try/catch: a throw here makes the caller reset the history
+  // cursor, dropping every other email in the range.
   const out: FetchedGmailMessage[] = [];
   for (const id of messageIds) {
     try {
