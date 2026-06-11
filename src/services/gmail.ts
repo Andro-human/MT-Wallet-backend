@@ -94,13 +94,31 @@ function stripInvisibleAndNormalizeSpaces(text: string): string {
     .replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
 }
 
+// Decode HTML entities to their Unicode chars so the invisible-strip pass can
+// see them. Senders encode preheader padding as numeric entities in the HTML
+// part (&#8199;&#847; = figure space + CGJ) — a regex tag-strip leaves those
+// as literal ASCII junk. &amp; is decoded last to avoid double-decoding
+// (&amp;#8199; must become "&#8199;" the string, not the char).
+const NAMED_ENTITIES: Record<string, string> = {
+  nbsp: " ", shy: "­", zwnj: "‌", zwj: "‍",
+  lt: "<", gt: ">", quot: '"', apos: "'",
+};
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&(nbsp|shy|zwnj|zwj|lt|gt|quot|apos);/g, (_, name) => NAMED_ENTITIES[name])
+    .replace(/&amp;/g, "&");
+}
+
 function stripHtml(html: string): string {
   return stripInvisibleAndNormalizeSpaces(
-    html
-      .replace(/<style[\s\S]*?<\/style>/gi, " ")
-      .replace(/<script[\s\S]*?<\/script>/gi, " ")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/&nbsp;/g, " "),
+    decodeHtmlEntities(
+      html
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<[^>]+>/g, " "),
+    ),
   )
     .replace(/\s+/g, " ")
     .trim();
@@ -238,26 +256,37 @@ export async function fetchNewMessagesSinceHistoryId(
 
   if (messageIds.length === 0) return [];
 
+  // Each message is fetched in its own try/catch: one deleted message (404
+  // from messages.get) or one malformed header must not abort the batch —
+  // the caller resets the history cursor on throw, which would silently
+  // drop every other email in the range.
   const out: FetchedGmailMessage[] = [];
   for (const id of messageIds) {
-    const msgRes = await gmail.users.messages.get({ userId: "me", id, format: "full" });
-    const msg = msgRes.data;
+    try {
+      const msgRes = await gmail.users.messages.get({ userId: "me", id, format: "full" });
+      const msg = msgRes.data;
 
-    // The history record can include messages whose label was later removed.
-    // Re-check current label membership before processing.
-    if (!msg.labelIds?.includes(labelId)) {
-      console.log(`[Gmail] Skipping ${id} — label no longer present on message`);
-      continue;
+      // The history record can include messages whose label was later removed.
+      // Re-check current label membership before processing.
+      if (!msg.labelIds?.includes(labelId)) {
+        console.log(`[Gmail] Skipping ${id} — label no longer present on message`);
+        continue;
+      }
+
+      const headers = msg.payload?.headers ?? [];
+      const fromHeader = headers.find((h) => h.name?.toLowerCase() === "from")?.value ?? "Unknown";
+      const subjectHeader = headers.find((h) => h.name?.toLowerCase() === "subject")?.value ?? "";
+      const dateHeader = headers.find((h) => h.name?.toLowerCase() === "date")?.value;
+      const body = extractPlainTextBody(msg.payload) || msg.snippet || "";
+      const parsedDate = dateHeader ? new Date(dateHeader) : new Date();
+      const timestamp = isNaN(parsedDate.getTime())
+        ? new Date().toISOString()
+        : parsedDate.toISOString();
+
+      out.push({ gmailMessageId: id, sender: fromHeader, subject: subjectHeader, body, timestamp });
+    } catch (err) {
+      console.error(`[Gmail] Failed to fetch/parse message ${id} — skipping:`, (err as Error).message);
     }
-
-    const headers = msg.payload?.headers ?? [];
-    const fromHeader = headers.find((h) => h.name?.toLowerCase() === "from")?.value ?? "Unknown";
-    const subjectHeader = headers.find((h) => h.name?.toLowerCase() === "subject")?.value ?? "";
-    const dateHeader = headers.find((h) => h.name?.toLowerCase() === "date")?.value;
-    const body = extractPlainTextBody(msg.payload) || msg.snippet || "";
-    const timestamp = dateHeader ? new Date(dateHeader).toISOString() : new Date().toISOString();
-
-    out.push({ gmailMessageId: id, sender: fromHeader, subject: subjectHeader, body, timestamp });
   }
 
   return out;

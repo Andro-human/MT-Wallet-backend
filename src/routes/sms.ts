@@ -741,11 +741,21 @@ router.post("/pubsub-ingest", async (req: Request, res: Response) => {
       try {
         fetched = await fetchNewMessagesSinceHistoryId(state.lastHistoryId, labelId);
       } catch (err) {
-        // history.list returns 404 when the cursor is too old (>7 days idle).
-        // Reset to the notification's historyId; we accept losing this batch.
+        // history.list returns 404 only when the cursor is too old (>7 days
+        // idle) — that's the one case where resetting forward is correct.
+        // On transient errors (network, 5xx) the cursor must stay put: we
+        // already ACKed Pub/Sub so there's no redelivery, and the next
+        // notification re-fetches the same range. Resetting on a transient
+        // error would silently drop every email in the range.
+        const status = (err as { response?: { status?: number }; code?: number | string }).response?.status
+          ?? (err as { code?: number | string }).code;
         const msg = (err as Error).message || String(err);
-        console.error(`[Pub/Sub] history.list failed (${msg}) — resetting cursor to ${notifHistoryId}`);
-        await updateGmailWatchState(user.id, { lastHistoryId: notifHistoryId });
+        if (status === 404 || status === "404") {
+          console.error(`[Pub/Sub] history cursor too old (${msg}) — resetting cursor to ${notifHistoryId}`);
+          await updateGmailWatchState(user.id, { lastHistoryId: notifHistoryId });
+        } else {
+          console.error(`[Pub/Sub] history.list failed transiently (${msg}) — keeping cursor for retry on next notification`);
+        }
         return;
       }
 
