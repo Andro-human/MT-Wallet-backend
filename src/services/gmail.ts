@@ -76,12 +76,32 @@ function base64UrlDecode(data: string): string {
   return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8");
 }
 
+// Defang "preheader padding": senders (Airbnb, Mailchimp templates, etc.) pad
+// the inbox snippet with sequences of invisible Unicode chars so the preview
+// blurb extends further than the visible content. Left alone, this padding
+// blows past our truncation window before the LLM sees the real body.
+//
+// First pass strips zero-width / combining marks that have no visible width.
+// Second pass normalizes Unicode space-like chars (figure space, nbsp,
+// ideographic space, etc.) to ASCII space so the later collapse can fold them.
+function stripInvisibleAndNormalizeSpaces(text: string): string {
+  // Strip zero-width / combining marks: soft hyphen, combining grapheme joiner,
+  // zero-width space family (ZWSP, ZWNJ, ZWJ, LRM, RLM), word joiner, BOM.
+  // Then normalize Unicode space-likes (nbsp, en/em space, figure space,
+  // ideographic space, etc.) to ASCII space.
+  return text
+    .replace(/[\u00AD\u034F\u200B-\u200F\u2060\uFEFF]/g, "")
+    .replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
+}
+
 function stripHtml(html: string): string {
-  return html
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
+  return stripInvisibleAndNormalizeSpaces(
+    html
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/g, " "),
+  )
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -113,7 +133,10 @@ function extractPlainTextBody(payload: gmail_v1.Schema$MessagePart | null | unde
   };
   walk(payload);
 
-  const plainText = plain.join("\n").trim();
+  // Normalize before measuring: preheader-padding senders inflate plainText.length
+  // with invisible Unicode chars, which would falsely pass the 120-char gate and
+  // hide the substantive content that's only in text/html.
+  const plainText = stripInvisibleAndNormalizeSpaces(plain.join("\n")).trim();
   if (plainText.length >= MIN_PLAINTEXT_CHARS) return plainText;
 
   const htmlText = html.join("\n").trim();
@@ -162,7 +185,7 @@ type FetchedGmailMessage = {
  */
 const DEFAULT_AI_BODY_CHARS = 500;
 export function cleanEmailBody(text: string, maxChars: number = DEFAULT_AI_BODY_CHARS): string {
-  const cleaned = text
+  const cleaned = stripInvisibleAndNormalizeSpaces(text)
     .replace(/https?:\/\/[^\s)>]+/g, "[link]")
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
