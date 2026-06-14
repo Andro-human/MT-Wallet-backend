@@ -118,6 +118,12 @@ function stripHtml(html: string): string {
 // We treat any text/plain shorter than this as "stub" and prefer html instead.
 const MIN_PLAINTEXT_CHARS = 120;
 
+// Some ESPs put raw HTML inside the text/plain part. A structural tag is the
+// signal — legit plain text doesn't open <html>/<body>/<table>/<style>/<div>.
+function looksLikeHtml(text: string): boolean {
+  return /<\s*(!doctype\s+html|html|head|body|table|style|div)\b/i.test(text);
+}
+
 /**
  * Walk a MIME tree, return decoded plain text. Prefers text/plain when it's
  * substantive (> MIN_PLAINTEXT_CHARS); otherwise falls back to crude HTML
@@ -132,7 +138,10 @@ function extractPlainTextBody(payload: gmail_v1.Schema$MessagePart | null | unde
 
   const walk = (node: gmail_v1.Schema$MessagePart): void => {
     if (node.mimeType === "text/plain" && node.body?.data) {
-      plain.push(base64UrlDecode(node.body.data));
+      const decoded = base64UrlDecode(node.body.data);
+      // A text/plain part that's actually HTML must be stripped, not used raw.
+      if (looksLikeHtml(decoded)) html.push(stripHtml(decoded));
+      else plain.push(decoded);
     } else if (node.mimeType === "text/html" && node.body?.data) {
       html.push(stripHtml(base64UrlDecode(node.body.data)));
     }
