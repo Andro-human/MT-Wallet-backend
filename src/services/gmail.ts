@@ -118,8 +118,7 @@ function stripHtml(html: string): string {
 // We treat any text/plain shorter than this as "stub" and prefer html instead.
 const MIN_PLAINTEXT_CHARS = 120;
 
-// Some ESPs put raw HTML inside the text/plain part. A structural tag is the
-// signal — legit plain text doesn't open <html>/<body>/<table>/<style>/<div>.
+// Some ESPs put raw HTML inside the text/plain part.
 function looksLikeHtml(text: string): boolean {
   return /<\s*(!doctype\s+html|html|head|body|table|style|div)\b/i.test(text);
 }
