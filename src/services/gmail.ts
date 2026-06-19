@@ -223,10 +223,14 @@ export function cleanEmailBody(text: string, maxChars: number = DEFAULT_AI_BODY_
 export async function fetchNewMessagesSinceHistoryId(
   startHistoryId: string,
   labelId: string,
-): Promise<FetchedGmailMessage[]> {
+): Promise<{ messages: FetchedGmailMessage[]; latestHistoryId: string | null }> {
   const gmail = getGmailClient();
   const seen = new Set<string>();
   const messageIds: string[] = [];
+
+  // history.list's response historyId is the mailbox high-water mark; the caller
+  // advances the cursor to this, not the (possibly older) notification historyId.
+  let latestHistoryId: string | null = null;
 
   let pageToken: string | undefined = undefined;
   do {
@@ -238,6 +242,7 @@ export async function fetchNewMessagesSinceHistoryId(
     };
     if (pageToken) params.pageToken = pageToken;
     const res = await gmail.users.history.list(params);
+    if (res.data.historyId) latestHistoryId = res.data.historyId;
     for (const record of res.data.history ?? []) {
       for (const added of record.messagesAdded ?? []) {
         const id = added.message?.id;
@@ -251,7 +256,7 @@ export async function fetchNewMessagesSinceHistoryId(
     pageToken = res.data.nextPageToken ?? undefined;
   } while (pageToken);
 
-  if (messageIds.length === 0) return [];
+  if (messageIds.length === 0) return { messages: [], latestHistoryId };
 
   // Per-message try/catch: a throw here makes the caller reset the history
   // cursor, dropping every other email in the range.
@@ -284,7 +289,7 @@ export async function fetchNewMessagesSinceHistoryId(
     }
   }
 
-  return out;
+  return { messages: out, latestHistoryId };
 }
 
 /**
