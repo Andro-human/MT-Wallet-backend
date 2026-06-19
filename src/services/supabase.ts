@@ -7,6 +7,8 @@ import {
   matchesExistingCrossChannelRow,
   type CrossChannelCandidate,
   type ExistingTransactionRow,
+  type AliasResolver,
+  type BankAlias,
 } from "./deduplication.js";
 
 // Create Supabase client with service role key (bypasses RLS)
@@ -167,13 +169,27 @@ export async function findTransactionByReferenceId(
   return data ? { id: data.id } : null;
 }
 
+export async function getBankAccountAliases(userId: string): Promise<BankAlias[]> {
+  const { data, error } = await supabase
+    .from("bank_account_aliases")
+    .select("source_bank_name, source_account_last4, target_bank_name, target_account_last4")
+    .eq("user_id", userId);
+
+  if (error) {
+    console.error("Failed to fetch bank_account_aliases:", error.message);
+    return [];
+  }
+  return (data || []) as BankAlias[];
+}
+
 /**
- * Layer 2a: find a phone↔email duplicate in the recent window.
- * Caller must ensure candidate has non-null account_last4 and bank_name.
+ * No account_last4 SQL filter on purpose — aliases can remap last4, so widen on
+ * amount+direction+window (a tiny set) and let the alias-aware fingerprint decide.
  */
 export async function findCrossChannelDuplicate(
   userId: string,
   candidate: CrossChannelCandidate,
+  resolve?: AliasResolver,
 ): Promise<{ id: string } | null> {
   const center = new Date(candidate.transacted_at).getTime();
   const from = new Date(center - CROSS_CHANNEL_WINDOW_MS).toISOString();
@@ -181,11 +197,10 @@ export async function findCrossChannelDuplicate(
 
   const { data, error } = await supabase
     .from("transactions")
-    .select("id, amount, direction, account_last4, bank_name, source, transacted_at")
+    .select("id, amount, direction, account_last4, bank_name, source, transacted_at, reference_id")
     .eq("user_id", userId)
     .eq("amount", candidate.amount)
     .eq("direction", candidate.direction)
-    .eq("account_last4", candidate.account_last4!)
     .gte("transacted_at", from)
     .lte("transacted_at", to);
 
@@ -195,7 +210,7 @@ export async function findCrossChannelDuplicate(
   }
 
   for (const row of (data || []) as ExistingTransactionRow[]) {
-    if (matchesExistingCrossChannelRow(candidate, row)) {
+    if (matchesExistingCrossChannelRow(candidate, row, resolve)) {
       return { id: row.id };
     }
   }

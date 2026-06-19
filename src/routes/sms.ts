@@ -11,10 +11,12 @@ import {
   updateGmailWatchState,
   findTransactionByReferenceId,
   findCrossChannelDuplicate,
+  getBankAccountAliases,
 } from "../services/supabase.js";
 import {
   findInBatchCrossChannelDuplicate,
   findInBatchReferenceIdDuplicate,
+  buildAliasResolver,
 } from "../services/deduplication.js";
 import { withUserIngestLock } from "../services/ingest-lock.js";
 import { convertToINR, isForeignCurrency } from "../services/currency.js";
@@ -203,6 +205,8 @@ async function processMessagesInBackgroundUnlocked(
 
     // Get user merchant overrides (Phase 2 - Name map & default categorization/expense flags)
     const userOverrides = await getUserMerchantMappings(user.id);
+
+    const aliasResolver = buildAliasResolver(await getBankAccountAliases(user.id));
 
     // Group overrides by raw_merchant
     const overridesMap = new Map<string, typeof userOverrides>();
@@ -474,7 +478,7 @@ async function processMessagesInBackgroundUnlocked(
 
       // Layer 2a: cross-channel soft fingerprint (phone ↔ email, 30 min)
       if (transactionData.account_last4 && transactionData.bank_name) {
-        if (findInBatchCrossChannelDuplicate(transactionData, transactionsToInsert)) {
+        if (findInBatchCrossChannelDuplicate(transactionData, transactionsToInsert, aliasResolver)) {
           skipped++;
           details.push({
             sms_id: msg.id,
@@ -486,7 +490,7 @@ async function processMessagesInBackgroundUnlocked(
           continue;
         }
 
-        const crossChannel = await findCrossChannelDuplicate(user.id, transactionData);
+        const crossChannel = await findCrossChannelDuplicate(user.id, transactionData, aliasResolver);
         if (crossChannel) {
           skipped++;
           details.push({
@@ -649,6 +653,16 @@ router.post("/shortcut-ingest", async (req: Request, res: Response) => {
 });
 
 
+// BigInt compare — Gmail historyIds can exceed Number.MAX_SAFE_INTEGER.
+function maxHistoryId(a: string, b: string | null): string {
+  if (!b) return a;
+  try {
+    return BigInt(a) >= BigInt(b) ? a : b;
+  } catch {
+    return a;
+  }
+}
+
 /**
  * POST /api/sms/pubsub-ingest
  *
@@ -723,57 +737,64 @@ router.post("/pubsub-ingest", async (req: Request, res: Response) => {
         return;
       }
 
-      const state = await getGmailWatchState(user.id);
-      if (!state?.lastHistoryId) {
-        // No cursor yet — most likely watch() hasn't been called. Seed from
-        // the notification and wait for the next one. We lose this batch but
-        // the next notification will advance correctly.
-        console.warn(
-          `[Pub/Sub] No last_history_id baseline — seeding to ${notifHistoryId} and skipping this batch`
-        );
-        await updateGmailWatchState(user.id, { lastHistoryId: notifHistoryId });
-        return;
-      }
-
-      const labelId = await getLabelIdByName(env.gmailLabelName);
-
-      let fetched;
-      try {
-        fetched = await fetchNewMessagesSinceHistoryId(state.lastHistoryId, labelId);
-      } catch (err) {
-        // Reset the cursor only on 404 (cursor too old). On transient errors
-        // it must stay put — Pub/Sub was already ACKed so there's no
-        // redelivery; the next notification re-fetches the same range.
-        const status = (err as { response?: { status?: number }; code?: number | string }).response?.status
-          ?? (err as { code?: number | string }).code;
-        const msg = (err as Error).message || String(err);
-        if (status === 404 || status === "404") {
-          console.error(`[Pub/Sub] history cursor too old (${msg}) — resetting cursor to ${notifHistoryId}`);
+      // The lock must span read-cursor → fetch → process → advance so concurrent
+      // notifications don't both read the same stale cursor and double-process.
+      // Call the *Unlocked* processor inside — withUserIngestLock is non-reentrant
+      // and nesting it for the same user deadlocks.
+      await withUserIngestLock(user.id, async () => {
+        const state = await getGmailWatchState(user.id);
+        if (!state?.lastHistoryId) {
+          // No cursor yet — most likely watch() hasn't been called. Seed from
+          // the notification and wait for the next one. We lose this batch but
+          // the next notification will advance correctly.
+          console.warn(
+            `[Pub/Sub] No last_history_id baseline — seeding to ${notifHistoryId} and skipping this batch`
+          );
           await updateGmailWatchState(user.id, { lastHistoryId: notifHistoryId });
-        } else {
-          console.error(`[Pub/Sub] history.list failed transiently (${msg}) — keeping cursor for retry on next notification`);
+          return;
         }
-        return;
-      }
 
-      console.log(`[Pub/Sub] Fetched ${fetched.length} new labeled message(s)`);
+        const labelId = await getLabelIdByName(env.gmailLabelName);
 
-      if (fetched.length > 0) {
-        // Clean + truncate once here. The result is both the AI's Pass 2 input
-        // AND what we store as raw_sms — single source of truth, smaller DB rows.
-        const raw = fetched.map((m) => ({
-          sender: m.sender,
-          subject: m.subject,
-          body: cleanEmailBody(m.body),
-          timestamp: m.timestamp,
-        }));
-        await processMessagesInBackground(user, raw, "email", startTime, "[Pub/Sub Ingest]");
-      }
+        let result;
+        try {
+          result = await fetchNewMessagesSinceHistoryId(state.lastHistoryId, labelId);
+        } catch (err) {
+          // Reset the cursor only on 404 (cursor too old). On transient errors
+          // it must stay put — Pub/Sub was already ACKed so there's no
+          // redelivery; the next notification re-fetches the same range.
+          const status = (err as { response?: { status?: number }; code?: number | string }).response?.status
+            ?? (err as { code?: number | string }).code;
+          const msg = (err as Error).message || String(err);
+          if (status === 404 || status === "404") {
+            console.error(`[Pub/Sub] history cursor too old (${msg}) — resetting cursor to ${notifHistoryId}`);
+            await updateGmailWatchState(user.id, { lastHistoryId: notifHistoryId });
+          } else {
+            console.error(`[Pub/Sub] history.list failed transiently (${msg}) — keeping cursor for retry on next notification`);
+          }
+          return;
+        }
 
-      // Advance cursor only AFTER processing completes. If processing throws,
-      // the next notification will re-fetch the same history range; dedupe
-      // happens at insert via content-hash sms_id collision.
-      await updateGmailWatchState(user.id, { lastHistoryId: notifHistoryId });
+        const fetched = result.messages;
+        console.log(`[Pub/Sub] Fetched ${fetched.length} new labeled message(s)`);
+
+        if (fetched.length > 0) {
+          // Clean + truncate once here. The result is both the AI's Pass 2 input
+          // AND what we store as raw_sms — single source of truth, smaller DB rows.
+          const raw = fetched.map((m) => ({
+            sender: m.sender,
+            subject: m.subject,
+            body: cleanEmailBody(m.body),
+            timestamp: m.timestamp,
+          }));
+          await processMessagesInBackgroundUnlocked(user, raw, "email", startTime, "[Pub/Sub Ingest]");
+        }
+
+        // Advance to the newest historyId the fetch covered, not the notification's
+        // (which can be older), or newer messages get re-fetched on every notification.
+        const advanceTo = maxHistoryId(notifHistoryId, result.latestHistoryId);
+        await updateGmailWatchState(user.id, { lastHistoryId: advanceTo });
+      });
     } catch (err) {
       console.error("[Pub/Sub] Background processing error:", err);
     }

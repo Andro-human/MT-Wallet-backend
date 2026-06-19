@@ -14,6 +14,39 @@ export function normalizeBankName(name: string | null | undefined): string | nul
   return trimmed.length > 0 ? trimmed : null;
 }
 
+// Prefix-match so "SBI" and "SBI Card" read as one issuer; substring would be too loose.
+export function bankNamesCompatible(a: string, b: string): boolean {
+  return a === b || a.startsWith(b) || b.startsWith(a);
+}
+
+export type BankAlias = {
+  source_bank_name: string | null;
+  source_account_last4: string | null;
+  target_bank_name: string | null;
+  target_account_last4: string | null;
+};
+
+export type ResolvedAccount = { bank: string | null; last4: string | null };
+export type AliasResolver = (bank: string | null, last4: string | null) => ResolvedAccount;
+
+const IDENTITY_RESOLVER: AliasResolver = (bank, last4) => ({ bank, last4 });
+
+function aliasKey(bank: string | null, last4: string | null): string {
+  return `${normalizeBankName(bank) ?? ""}|${(last4 ?? "").trim()}`;
+}
+
+/** Build a resolver that canonicalizes (bank, last4) via the user's aliases. */
+export function buildAliasResolver(aliases: BankAlias[]): AliasResolver {
+  const map = new Map<string, ResolvedAccount>();
+  for (const a of aliases) {
+    map.set(aliasKey(a.source_bank_name, a.source_account_last4), {
+      bank: a.target_bank_name,
+      last4: a.target_account_last4,
+    });
+  }
+  return (bank, last4) => map.get(aliasKey(bank, last4)) ?? { bank, last4 };
+}
+
 export function getIngestChannel(source: string): IngestChannel {
   if (PHONE_SOURCES.has(source)) return "phone";
   if (EMAIL_SOURCES.has(source)) return "email";
@@ -26,7 +59,7 @@ export function isAutomatedIngestSource(source: string): boolean {
 
 export type CrossChannelCandidate = Pick<
   TransactionInsert,
-  "amount" | "direction" | "account_last4" | "bank_name" | "transacted_at" | "source"
+  "amount" | "direction" | "account_last4" | "bank_name" | "transacted_at" | "source" | "reference_id"
 >;
 
 export type ExistingTransactionRow = {
@@ -37,6 +70,7 @@ export type ExistingTransactionRow = {
   bank_name: string | null;
   source: string;
   transacted_at: string;
+  reference_id: string | null;
 };
 
 function withinCrossChannelWindow(a: string, b: string): boolean {
@@ -51,6 +85,7 @@ function withinCrossChannelWindow(a: string, b: string): boolean {
 export function matchesCrossChannelFingerprint(
   candidate: CrossChannelCandidate,
   existing: CrossChannelCandidate & { id?: string },
+  resolve: AliasResolver = IDENTITY_RESOLVER,
 ): boolean {
   if (!isAutomatedIngestSource(candidate.source)) return false;
   if (!isAutomatedIngestSource(existing.source)) return false;
@@ -60,15 +95,24 @@ export function matchesCrossChannelFingerprint(
   if (candidateChannel === "other" || existingChannel === "other") return false;
   if (candidateChannel === existingChannel) return false;
 
-  if (!candidate.account_last4 || !existing.account_last4) return false;
+  // Differing references = distinct payments; never fuzzy-merge them. Same/absent ref falls through.
+  const candRef = candidate.reference_id?.trim();
+  const existRef = existing.reference_id?.trim();
+  if (candRef && existRef && candRef !== existRef) return false;
 
-  const candidateBank = normalizeBankName(candidate.bank_name);
-  const existingBank = normalizeBankName(existing.bank_name);
-  if (!candidateBank || !existingBank || candidateBank !== existingBank) return false;
+  // Canonicalize via aliases so "SBI Card"/"SBI" (and remapped last4) compare equal.
+  const c = resolve(candidate.bank_name ?? null, candidate.account_last4 ?? null);
+  const e = resolve(existing.bank_name ?? null, existing.account_last4 ?? null);
+
+  if (!c.last4 || !e.last4) return false;
+  if (c.last4 !== e.last4) return false;
+
+  const candidateBank = normalizeBankName(c.bank);
+  const existingBank = normalizeBankName(e.bank);
+  if (!candidateBank || !existingBank || !bankNamesCompatible(candidateBank, existingBank)) return false;
 
   if (candidate.amount !== existing.amount) return false;
   if (candidate.direction !== existing.direction) return false;
-  if (candidate.account_last4 !== existing.account_last4) return false;
 
   return withinCrossChannelWindow(candidate.transacted_at, existing.transacted_at);
 }
@@ -76,9 +120,10 @@ export function matchesCrossChannelFingerprint(
 export function findInBatchCrossChannelDuplicate(
   candidate: CrossChannelCandidate,
   batch: CrossChannelCandidate[],
+  resolve: AliasResolver = IDENTITY_RESOLVER,
 ): CrossChannelCandidate | null {
   for (const existing of batch) {
-    if (matchesCrossChannelFingerprint(candidate, existing)) {
+    if (matchesCrossChannelFingerprint(candidate, existing, resolve)) {
       return existing;
     }
   }
@@ -97,6 +142,7 @@ export function findInBatchReferenceIdDuplicate(
 export function matchesExistingCrossChannelRow(
   candidate: CrossChannelCandidate,
   row: ExistingTransactionRow,
+  resolve: AliasResolver = IDENTITY_RESOLVER,
 ): boolean {
   return matchesCrossChannelFingerprint(candidate, {
     amount: Number(row.amount),
@@ -105,5 +151,6 @@ export function matchesExistingCrossChannelRow(
     bank_name: row.bank_name,
     transacted_at: row.transacted_at,
     source: row.source as CrossChannelCandidate["source"],
-  });
+    reference_id: row.reference_id,
+  }, resolve);
 }
