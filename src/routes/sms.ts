@@ -17,6 +17,7 @@ import {
   findInBatchCrossChannelDuplicate,
   findInBatchReferenceIdDuplicate,
   buildAliasResolver,
+  isAutomatedIngestSource,
 } from "../services/deduplication.js";
 import { withUserIngestLock } from "../services/ingest-lock.js";
 import { convertToINR, isForeignCurrency } from "../services/currency.js";
@@ -476,8 +477,10 @@ async function processMessagesInBackgroundUnlocked(
         }
       }
 
-      // Layer 2a: cross-channel soft fingerprint (phone ↔ email, 30 min)
-      if (transactionData.account_last4 && transactionData.bank_name) {
+      // Layer 2a: cross-channel soft fingerprint (phone ↔ email, 30 min).
+      // No last4/bank gate — the fingerprint also merges wallet rows (no last4) on
+      // matching merchant + bank, so gate only on the source being automated ingest.
+      if (isAutomatedIngestSource(transactionData.source)) {
         if (findInBatchCrossChannelDuplicate(transactionData, transactionsToInsert, aliasResolver)) {
           skipped++;
           details.push({

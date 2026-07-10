@@ -19,6 +19,27 @@ export function bankNamesCompatible(a: string, b: string): boolean {
   return a === b || a.startsWith(b) || b.startsWith(a);
 }
 
+const MERCHANT_SUFFIXES =
+  /\b(private limited|pvt\.? ltd\.?|private ltd|limited|ltd|pvt|inc|llc)\b/g;
+
+export function normalizeMerchant(name: string | null | undefined): string | null {
+  if (!name) return null;
+  const s = name
+    .trim()
+    .toLowerCase()
+    .replace(/[.,]/g, " ")
+    .replace(MERCHANT_SUFFIXES, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return s.length > 0 ? s : null;
+}
+
+function normalizeSender(s: string | null | undefined): string | null {
+  if (!s) return null;
+  const t = s.trim().toLowerCase();
+  return t.length > 0 ? t : null;
+}
+
 export type BankAlias = {
   source_bank_name: string | null;
   source_account_last4: string | null;
@@ -60,7 +81,10 @@ export function isAutomatedIngestSource(source: string): boolean {
 export type CrossChannelCandidate = Pick<
   TransactionInsert,
   "amount" | "direction" | "account_last4" | "bank_name" | "transacted_at" | "source" | "reference_id"
->;
+> & {
+  merchant: string | null;
+  sms_sender: string | null;
+};
 
 export type ExistingTransactionRow = {
   id: string;
@@ -71,6 +95,8 @@ export type ExistingTransactionRow = {
   source: string;
   transacted_at: string;
   reference_id: string | null;
+  merchant: string | null;
+  sms_sender: string | null;
 };
 
 function withinCrossChannelWindow(a: string, b: string): boolean {
@@ -78,9 +104,26 @@ function withinCrossChannelWindow(a: string, b: string): boolean {
   return diff <= CROSS_CHANNEL_WINDOW_MS;
 }
 
+// A single notifier (a bank SMS short-code, a Razorpay/Amazon Pay/Google email
+// address) reports any one payment exactly once. So two rows from the SAME notifier
+// are two real payments; two rows from DIFFERENT notifiers are one payment seen twice.
+// sms_sender is that notifier identity. When it's absent we fall back to the coarser
+// channel (phone vs email).
+function sameNotifier(a: CrossChannelCandidate, b: CrossChannelCandidate): boolean {
+  const sa = normalizeSender(a.sms_sender);
+  const sb = normalizeSender(b.sms_sender);
+  if (sa && sb) return sa === sb;
+  return getIngestChannel(a.source) === getIngestChannel(b.source);
+}
+
 /**
- * Layer 2a: phone ↔ email soft fingerprint. Requires amount, direction,
- * account_last4, and bank_name on both sides; channels must differ.
+ * Strong-tier auto-merge fingerprint. Two automated-ingest rows are the same payment
+ * when amount + direction match within the window, they come from DIFFERENT notifiers,
+ * and one strong corroborator holds: the same card (last4), or the same merchant on a
+ * compatible bank. Bank name and reference are deliberately NOT required to agree —
+ * different notifiers report different banks (HSBC vs Razorpay) and different reference
+ * schemes (bank RRN vs Google order id) for the very same payment. Weaker cases
+ * (merchant-only, banks differ) are left for the in-app duplicate banner to confirm.
  */
 export function matchesCrossChannelFingerprint(
   candidate: CrossChannelCandidate,
@@ -90,31 +133,34 @@ export function matchesCrossChannelFingerprint(
   if (!isAutomatedIngestSource(candidate.source)) return false;
   if (!isAutomatedIngestSource(existing.source)) return false;
 
-  const candidateChannel = getIngestChannel(candidate.source);
-  const existingChannel = getIngestChannel(existing.source);
-  if (candidateChannel === "other" || existingChannel === "other") return false;
-  if (candidateChannel === existingChannel) return false;
+  if (candidate.amount !== existing.amount) return false;
+  if (candidate.direction !== existing.direction) return false;
+  if (!withinCrossChannelWindow(candidate.transacted_at, existing.transacted_at)) return false;
 
-  // Differing references = distinct payments; never fuzzy-merge them. Same/absent ref falls through.
-  const candRef = candidate.reference_id?.trim();
-  const existRef = existing.reference_id?.trim();
-  if (candRef && existRef && candRef !== existRef) return false;
+  if (sameNotifier(candidate, existing)) return false;
 
   // Canonicalize via aliases so "SBI Card"/"SBI" (and remapped last4) compare equal.
   const c = resolve(candidate.bank_name ?? null, candidate.account_last4 ?? null);
   const e = resolve(existing.bank_name ?? null, existing.account_last4 ?? null);
 
-  if (!c.last4 || !e.last4) return false;
-  if (c.last4 !== e.last4) return false;
+  if (c.last4 && e.last4 && c.last4 === e.last4) return true;
 
+  const candidateMerchant = normalizeMerchant(candidate.merchant ?? null);
+  const existingMerchant = normalizeMerchant(existing.merchant ?? null);
   const candidateBank = normalizeBankName(c.bank);
   const existingBank = normalizeBankName(e.bank);
-  if (!candidateBank || !existingBank || !bankNamesCompatible(candidateBank, existingBank)) return false;
+  if (
+    candidateMerchant &&
+    existingMerchant &&
+    candidateMerchant === existingMerchant &&
+    candidateBank &&
+    existingBank &&
+    bankNamesCompatible(candidateBank, existingBank)
+  ) {
+    return true;
+  }
 
-  if (candidate.amount !== existing.amount) return false;
-  if (candidate.direction !== existing.direction) return false;
-
-  return withinCrossChannelWindow(candidate.transacted_at, existing.transacted_at);
+  return false;
 }
 
 export function findInBatchCrossChannelDuplicate(
@@ -152,5 +198,7 @@ export function matchesExistingCrossChannelRow(
     transacted_at: row.transacted_at,
     source: row.source as CrossChannelCandidate["source"],
     reference_id: row.reference_id,
+    merchant: row.merchant,
+    sms_sender: row.sms_sender,
   }, resolve);
 }

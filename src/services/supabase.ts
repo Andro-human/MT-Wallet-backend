@@ -197,7 +197,7 @@ export async function findCrossChannelDuplicate(
 
   const { data, error } = await supabase
     .from("transactions")
-    .select("id, amount, direction, account_last4, bank_name, source, transacted_at, reference_id")
+    .select("id, amount, direction, account_last4, bank_name, source, transacted_at, reference_id, merchant, sms_sender")
     .eq("user_id", userId)
     .eq("amount", candidate.amount)
     .eq("direction", candidate.direction)
