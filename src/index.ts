@@ -33,8 +33,10 @@ async function main() {
     { default: smsRoutes },
     { default: importRoutes },
     { default: syncRunsRoutes },
+    { default: enrichmentRoutes },
     gmailService,
     supabaseService,
+    enrichmentJob,
   ] = await Promise.all([
     import("express"),
     import("cors"),
@@ -42,8 +44,10 @@ async function main() {
     import("./routes/sms.js"),
     import("./routes/import.js"),
     import("./routes/sync-runs.js"),
+    import("./routes/enrichment.js"),
     import("./services/gmail.js"),
     import("./services/supabase.js"),
+    import("./services/enrichmentJob.js"),
   ]);
 
   console.log("[startup] All modules loaded successfully.");
@@ -66,6 +70,7 @@ async function main() {
   app.use("/api/sms", smsRoutes);
   app.use("/api/import", importRoutes);
   app.use("/api/sync-runs", syncRunsRoutes);
+  app.use("/api/enrichment", enrichmentRoutes);
 
   // Root health check
   app.get("/", (_req, res) => {
@@ -138,6 +143,22 @@ async function main() {
   setTimeout(() => { void ensureGmailWatch(); }, 2000);
   // Renew every 24h thereafter. Setting unref so it doesn't keep the process alive in tests.
   setInterval(() => { void ensureGmailWatch(); }, ONE_DAY_MS).unref();
+
+  // ── Nightly enrichment (Layer B) ──────────────────────────────────────────
+  // Runs once per IST day during the 02:00 IST hour. Checking every 15 min
+  // (instead of a single daily timer) survives restarts and clock drift; the
+  // pass itself is idempotent, so a duplicate trigger enriches nothing.
+  const ENRICH_HOUR_IST = 2;
+  let lastEnrichDay = "";
+  setInterval(() => {
+    const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+    const day = ist.toISOString().slice(0, 10);
+    if (ist.getUTCHours() !== ENRICH_HOUR_IST || lastEnrichDay === day) return;
+    lastEnrichDay = day;
+    enrichmentJob.runEnrichmentPass().catch((err: Error) => {
+      console.error("[enrichment] nightly pass failed:", err.message);
+    });
+  }, 15 * 60 * 1000).unref();
 }
 
 main().catch((err) => {

@@ -25,15 +25,9 @@
  *   --no-persist       run the AI but don't write txn_enrichment (A/B probes)
  */
 import "dotenv/config";
-import { createHash } from "node:crypto";
 import { supabase } from "../src/services/supabase.js";
 import { enrichTransactions, type EnrichInput } from "../src/services/enrichment.js";
-
-const INR_PER_USD = 95.2;
-const PRICES_PER_M: Record<string, { input: number; output: number }> = {
-  "gemini-2.5-flash": { input: 0.3, output: 2.5 },
-  "gemini-2.5-flash-lite": { input: 0.1, output: 0.4 },
-};
+import { noteHash, loadVocabulary, costRupees } from "../src/services/enrichmentJob.js";
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`);
@@ -52,14 +46,6 @@ const EXCLUDE = (arg("exclude") ?? "").split(",").filter(Boolean);
 const ONLY = (arg("only") ?? "").split(",").filter(Boolean);
 const DRY_RUN = flag("dry-run");
 const NO_PERSIST = flag("no-persist");
-
-const noteHash = (note: string) => createHash("sha256").update(note.trim()).digest("hex");
-
-function costRupees(usage: { input: number; output: number; reasoning: number }): number {
-  const p = PRICES_PER_M[MODEL];
-  if (!p) return NaN;
-  return ((usage.input * p.input + (usage.output + usage.reasoning) * p.output) / 1_000_000) * INR_PER_USD;
-}
 
 type Row = {
   id: string;
@@ -125,21 +111,6 @@ async function selectPending(): Promise<Row[]> {
   return picked;
 }
 
-async function loadVocabulary(categories: string[]): Promise<Record<string, string[]>> {
-  const { data, error } = await supabase
-    .from("txn_enrichment")
-    .select("item_label, transactions(categories(slug))");
-  if (error) throw new Error(`vocab load failed: ${error.message}`);
-  const vocab: Record<string, Set<string>> = {};
-  for (const row of data ?? []) {
-    const slug = (row.transactions as unknown as { categories: { slug: string } | null } | null)
-      ?.categories?.slug;
-    if (!slug || !categories.includes(slug)) continue;
-    (vocab[slug] ??= new Set()).add(row.item_label);
-  }
-  return Object.fromEntries(Object.entries(vocab).map(([k, v]) => [k, [...v].sort()]));
-}
-
 async function main() {
   const pending = await selectPending();
   console.log(`Selected ${pending.length} txns (limit ${LIMIT}, model ${MODEL}, batch ${BATCH_SIZE})`);
@@ -180,7 +151,7 @@ async function main() {
     }));
 
     const res = await enrichTransactions(inputs, allSlugs, vocab, MODEL);
-    const batchCost = costRupees(res);
+    const batchCost = costRupees(MODEL, res);
     spent += batchCost;
     totals.input += res.input;
     totals.output += res.output;
