@@ -1,4 +1,4 @@
-import { generateObject } from "ai";
+import { generateObject, NoObjectGeneratedError } from "ai";
 import { google } from "@ai-sdk/google";
 import { groq } from "@ai-sdk/groq";
 import { z } from "zod";
@@ -136,7 +136,10 @@ export type ExtractedFields = z.infer<typeof ExtractedFieldsSchema>;
  * sync_run that hits classifier + extractor (different models) shows two
  * entries, while one that falls back to the same model twice shows one.
  */
-export type ModelUsage = Record<string, { input: number; output: number }>;
+export type ModelUsage = Record<
+  string,
+  { input: number; output: number; reasoning: number }
+>;
 
 export interface ParseAndCategorizeResult {
   parsed: ParsedTransaction[];
@@ -150,7 +153,9 @@ export interface ParseAndCategorizeResult {
 const PRIMARY_PROVIDER = "google";
 const PRIMARY_MODEL = "gemini-2.5-flash";
 const FALLBACK_PROVIDER = "groq";
-const FALLBACK_MODEL = "llama-3.3-70b-versatile";
+// Must be on Groq's structured-outputs (json_schema) list — llama-3.3 is not,
+// and @ai-sdk/groq v2 no longer falls back to prompt-injected JSON mode.
+const FALLBACK_MODEL = "openai/gpt-oss-120b";
 
 // Classifier model: tiny task (yes/no + skip reason). Use the cheapest
 // reliable Google tier; falls back to the same Groq model as extraction.
@@ -190,9 +195,13 @@ function tryRecoverArrayFromError<T extends z.ZodTypeAny>(
   arraySchema: z.ZodArray<T>,
 ): z.infer<typeof arraySchema> | null {
   if (!(error instanceof Error)) return null;
-  const cause = (error as Error & { cause?: unknown }).cause;
-  if (!cause || typeof cause !== "object") return null;
-  const value = (cause as { value?: unknown }).value;
+  const value = NoObjectGeneratedError.isInstance(error)
+    ? error.text
+    : (() => {
+        const cause = (error as Error & { cause?: unknown }).cause;
+        if (!cause || typeof cause !== "object") return null;
+        return (cause as { value?: unknown }).value;
+      })();
   if (!value) return null;
 
   const parseValue = (v: unknown): unknown => {
@@ -213,6 +222,13 @@ function tryRecoverArrayFromError<T extends z.ZodTypeAny>(
   }
 
   if (parsedValue && typeof parsedValue === "object") {
+    // Envelope object with a single array value ({"elements": [...]} from the
+    // SDK's output:'array' mode, or a model-invented wrapper key).
+    const values = Object.values(parsedValue as Record<string, unknown>);
+    if (values.length === 1 && Array.isArray(values[0])) {
+      const validated = arraySchema.safeParse(values[0]);
+      if (validated.success) return validated.data;
+    }
     const validated = arraySchema.safeParse([parsedValue]);
     return validated.success ? validated.data : null;
   }
@@ -220,14 +236,33 @@ function tryRecoverArrayFromError<T extends z.ZodTypeAny>(
   return null;
 }
 
-type CallResult<T> = { data: T; input: number; output: number };
+type TokenCounts = { input: number; output: number; reasoning: number };
+type CallResult<T> = { data: T } & TokenCounts;
 
 /** Accumulate per-model token usage into an aggregator map (mutates in place). */
-function addUsage(into: ModelUsage, model: string, input: number, output: number) {
-  const bucket = into[model] ?? { input: 0, output: 0 };
-  bucket.input += input;
-  bucket.output += output;
+function addUsage(into: ModelUsage, model: string, counts: TokenCounts) {
+  const bucket = into[model] ?? { input: 0, output: 0, reasoning: 0 };
+  bucket.input += counts.input;
+  bucket.output += counts.output;
+  bucket.reasoning += counts.reasoning;
   into[model] = bucket;
+}
+
+/**
+ * Gemini bills thinking ("reasoning") tokens at the output rate but reports
+ * them separately from visible output; keep them separate here too so cost
+ * math downstream is (output + reasoning) * output_price.
+ */
+function usageCounts(usage: {
+  inputTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+} | undefined): TokenCounts {
+  return {
+    input: usage?.inputTokens ?? 0,
+    output: usage?.outputTokens ?? 0,
+    reasoning: usage?.reasoningTokens ?? 0,
+  };
 }
 
 async function callModelWithRetry<T extends z.ZodTypeAny>(
@@ -236,8 +271,16 @@ async function callModelWithRetry<T extends z.ZodTypeAny>(
   systemPrompt: string,
   userPrompt: string,
   schema: z.ZodArray<T>,
+  usage: ModelUsage,
 ): Promise<CallResult<z.infer<z.ZodArray<T>>>> {
   let lastError: unknown;
+  // Tokens billed by attempts that failed schema validation and were retried.
+  const wasted: TokenCounts = { input: 0, output: 0, reasoning: 0 };
+  const withWasted = (c: TokenCounts): TokenCounts => ({
+    input: c.input + wasted.input,
+    output: c.output + wasted.output,
+    reasoning: c.reasoning + wasted.reasoning,
+  });
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
@@ -245,30 +288,41 @@ async function callModelWithRetry<T extends z.ZodTypeAny>(
         `[ai] Calling ${modelId} attempt ${attempt}/${MAX_ATTEMPTS} (provider=${provider})`
       );
 
-      const result = await generateObject({
+      const common = {
         model: getModel(provider, modelId),
-        schema,
         system: systemPrompt,
         prompt: userPrompt,
         temperature: 0,
         maxRetries: 0, // retries handled here so we control backoff + logging
-      });
+      } as const;
+      // Groq's json_schema mode rejects root-level arrays; output:'array'
+      // wraps in an object envelope the SDK unwraps. Google keeps the plain
+      // array schema (proven shape in production).
+      const result =
+        provider === "groq"
+          ? await generateObject({ ...common, output: "array", schema: schema.element })
+          : await generateObject({ ...common, schema });
       if (attempt > 1) {
         console.log(`[ai] ${modelId} succeeded on attempt ${attempt}/${MAX_ATTEMPTS}`);
       }
       return {
-        data: result.object,
-        input: result.usage?.promptTokens ?? 0,
-        output: result.usage?.completionTokens ?? 0,
+        data: result.object as z.infer<z.ZodArray<T>>,
+        ...withWasted(usageCounts(result.usage)),
       };
     } catch (error) {
       const recovered = tryRecoverArrayFromError(error, schema);
       if (recovered) {
-        // Recovered output didn't go through generateObject's usage tally — we
-        // don't have a reliable token count for these. Report 0 so the row is
-        // visibly suspicious in the UI rather than over- or under-counting.
-        console.warn(`[ai] ${modelId} recovered structured output from provider error envelope (usage unknown)`);
-        return { data: recovered, input: 0, output: 0 };
+        // NoObjectGeneratedError carries the real usage of the failed call;
+        // these tokens ARE billed, so log them instead of the old 0.
+        const usage = NoObjectGeneratedError.isInstance(error) ? error.usage : undefined;
+        console.warn(`[ai] ${modelId} recovered structured output from provider error envelope`);
+        return { data: recovered, ...withWasted(usageCounts(usage)) };
+      }
+      if (NoObjectGeneratedError.isInstance(error)) {
+        const u = usageCounts(error.usage);
+        wasted.input += u.input;
+        wasted.output += u.output;
+        wasted.reasoning += u.reasoning;
       }
       lastError = error;
       const message = sanitizeErrorMessage(error);
@@ -284,6 +338,9 @@ async function callModelWithRetry<T extends z.ZodTypeAny>(
     }
   }
 
+  // All attempts failed and the caller will fall back to another model; the
+  // failed attempts' tokens were still billed, so record them before bailing.
+  addUsage(usage, modelId, wasted);
   throw lastError;
 }
 
@@ -345,8 +402,9 @@ async function classifyBatch(
       systemPrompt,
       userPrompt,
       ClassificationsArraySchema,
+      usage,
     );
-    addUsage(usage, CLASSIFIER_MODEL, result.input, result.output);
+    addUsage(usage, CLASSIFIER_MODEL, result);
     return { classifications: result.data, model: CLASSIFIER_MODEL };
   } catch (primaryErr) {
     console.warn(
@@ -358,8 +416,9 @@ async function classifyBatch(
       systemPrompt,
       userPrompt,
       ClassificationsArraySchema,
+      usage,
     );
-    addUsage(usage, FALLBACK_MODEL, result.input, result.output);
+    addUsage(usage, FALLBACK_MODEL, result);
     return { classifications: result.data, model: FALLBACK_MODEL };
   }
 }
@@ -399,8 +458,9 @@ async function extractBatch(
       systemPrompt,
       userPrompt,
       BatchExtractedArraySchema,
+      usage,
     );
-    addUsage(usage, PRIMARY_MODEL, result.input, result.output);
+    addUsage(usage, PRIMARY_MODEL, result);
     return { extracts: result.data, model: PRIMARY_MODEL };
   } catch (primaryErr) {
     console.warn(
@@ -412,8 +472,9 @@ async function extractBatch(
       systemPrompt,
       userPrompt,
       BatchExtractedArraySchema,
+      usage,
     );
-    addUsage(usage, FALLBACK_MODEL, result.input, result.output);
+    addUsage(usage, FALLBACK_MODEL, result);
     return { extracts: result.data, model: FALLBACK_MODEL };
   }
 }
@@ -429,7 +490,7 @@ async function extractBatch(
 export async function extractTransactionFields(
   message: { body: string; sender: string },
   categories: Category[]
-): Promise<{ fields: ExtractedFields; model: string }> {
+): Promise<{ fields: ExtractedFields; model: string; usage: ModelUsage }> {
   const categoryList = categories.map((c) => c.slug).join(", ");
 
   const systemPrompt = `Extract transaction fields from a banking SMS. Already confirmed a transaction — don't re-classify, don't refuse.
@@ -446,28 +507,39 @@ SMS body:
 ${message.body}
 """`;
 
+  // Shared across primary + fallback so a failed primary's billed tokens
+  // (NoObjectGeneratedError still carries usage) aren't dropped.
+  const usage: ModelUsage = {};
   const callOnce = async (provider: "google" | "groq", modelId: string) => {
-    const result = await generateObject({
-      model: getModel(provider, modelId),
-      schema: ExtractedFieldsSchema,
-      system: systemPrompt,
-      prompt: userPrompt,
-      temperature: 0,
-      maxRetries: 0,
-    });
-    return result.object;
+    try {
+      const result = await generateObject({
+        model: getModel(provider, modelId),
+        schema: ExtractedFieldsSchema,
+        system: systemPrompt,
+        prompt: userPrompt,
+        temperature: 0,
+        maxRetries: 0,
+      });
+      addUsage(usage, modelId, usageCounts(result.usage));
+      return result.object;
+    } catch (error) {
+      if (NoObjectGeneratedError.isInstance(error)) {
+        addUsage(usage, modelId, usageCounts(error.usage));
+      }
+      throw error;
+    }
   };
 
   try {
     const fields = await callOnce(PRIMARY_PROVIDER, PRIMARY_MODEL);
-    return { fields, model: PRIMARY_MODEL };
+    return { fields, model: PRIMARY_MODEL, usage };
   } catch (primaryErr) {
     console.warn(
       `[ai] extractTransactionFields primary ${PRIMARY_MODEL} failed (${sanitizeErrorMessage(primaryErr)}); falling back to ${FALLBACK_MODEL}`
     );
     try {
       const fields = await callOnce(FALLBACK_PROVIDER, FALLBACK_MODEL);
-      return { fields, model: FALLBACK_MODEL };
+      return { fields, model: FALLBACK_MODEL, usage };
     } catch (fallbackErr) {
       console.error("[ai] extractTransactionFields both providers failed", {
         primary: sanitizeErrorMessage(primaryErr),

@@ -2,6 +2,7 @@ import { createClient } from "@supabase/supabase-js";
 import { env } from "../config/env.js";
 import type { Category, GmailWatchState, User, ParsedTransactionResult, SMSMessage, UserMerchantMapping } from "../types/index.js";
 import type { TransactionInsert } from "../schemas/transaction.js";
+import type { ModelUsage } from "./ai.js";
 import {
   CROSS_CHANNEL_WINDOW_MS,
   matchesExistingCrossChannelRow,
@@ -361,6 +362,28 @@ export async function updateSyncRunDetail(params: {
 }
 
 /**
+ * Merge additional per-model token usage into a sync_run's `usage` jsonb.
+ * Used by the reclassify preview path, whose AI calls happen after the run
+ * row was written. Delegates to the `add_sync_run_usage` Postgres function —
+ * a single UPDATE — so concurrent calls can't clobber each other's increments.
+ */
+export async function addSyncRunUsage(params: {
+  runId: string;
+  userId: string;
+  usage: ModelUsage;
+}): Promise<{ success: boolean; error?: string }> {
+  const { error } = await supabase.rpc("add_sync_run_usage", {
+    p_run_id: params.runId,
+    p_user_id: params.userId,
+    p_usage: params.usage,
+  });
+  if (error) {
+    return { success: false, error: error.message };
+  }
+  return { success: true };
+}
+
+/**
  * Delete any transaction matching (user_id, sms_id). No-op if none exists.
  */
 export async function deleteTransactionBySmsId(
@@ -398,9 +421,10 @@ export async function insertSyncRun(params: {
   errorMessage?: string;
   source?: string;
   rowidRange?: { from: number; to: number };
-  // Per-model token usage. Shape: { [modelId]: { input, output } }.
+  // Per-model token usage. Shape: { [modelId]: { input, output, reasoning } }.
+  // `reasoning` = Gemini thinking tokens (billed at the output rate).
   // Null for failed runs that never produced AI usage data.
-  usage?: Record<string, { input: number; output: number }> | null;
+  usage?: ModelUsage | null;
 }): Promise<{ id: string | null; error?: string }> {
   const { data, error } = await supabase
     .from("sync_runs")
