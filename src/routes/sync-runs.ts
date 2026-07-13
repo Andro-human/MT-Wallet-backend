@@ -7,6 +7,7 @@ import {
   deleteTransactionBySmsId,
   insertTransaction,
   updateSyncRunDetail,
+  addSyncRunUsage,
 } from "../services/supabase.js";
 import { extractTransactionFields } from "../services/ai.js";
 import { nullifyStringy } from "../services/sanitize.js";
@@ -99,9 +100,12 @@ router.post(
     if (!hasBody) {
       try {
         const categories = await getCategories(user.id);
-        const { fields, model } = await extractTransactionFields(
+        const { fields, model, usage } = await extractTransactionFields(
           { body: sms.body, sender: sms.sender },
           categories
+        );
+        addSyncRunUsage({ runId: runIdParam, userId: user.id, usage }).catch((err) =>
+          console.error("[sync-runs] Failed to log reclassify usage:", err)
         );
         res.json({
           success: true,

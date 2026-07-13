@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import crypto from "crypto";
-import { parseAndCategorize } from "../services/ai.js";
+import { parseAndCategorize, type ModelUsage } from "../services/ai.js";
 import {
   getUserByApiKey,
   getCategories,
@@ -264,7 +264,7 @@ async function processMessagesInBackgroundUnlocked(
     // Parse and categorize with AI
     let parsed;
     let aiModelUsed = "unknown";
-    let aiUsage: Record<string, { input: number; output: number }> = {};
+    let aiUsage: ModelUsage = {};
     try {
       const aiResult = await parseAndCategorize(normalizedMessages, categories);
       parsed = aiResult.parsed;
