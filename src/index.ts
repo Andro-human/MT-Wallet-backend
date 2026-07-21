@@ -38,6 +38,7 @@ async function main() {
     gmailService,
     supabaseService,
     enrichmentJob,
+    subscriptionSync,
   ] = await Promise.all([
     import("express"),
     import("cors"),
@@ -50,6 +51,7 @@ async function main() {
     import("./services/gmail.js"),
     import("./services/supabase.js"),
     import("./services/enrichmentJob.js"),
+    import("./services/subscriptionSync.js"),
   ]);
 
   console.log("[startup] All modules loaded successfully.");
@@ -158,9 +160,15 @@ async function main() {
     const day = ist.toISOString().slice(0, 10);
     if (ist.getUTCHours() !== ENRICH_HOUR_IST || lastEnrichDay === day) return;
     lastEnrichDay = day;
-    enrichmentJob.runEnrichmentPass().catch((err: Error) => {
-      console.error("[enrichment] nightly pass failed:", err.message);
-    });
+    enrichmentJob
+      .runEnrichmentPass()
+      .then(() => subscriptionSync.reconcileSubscriptions())
+      .then((r) => {
+        if (r.linked > 0) console.log(`[subscriptions] reconcile linked ${r.linked} txn(s) across ${r.users} user(s)`);
+      })
+      .catch((err: Error) => {
+        console.error("[enrichment] nightly pass failed:", err.message);
+      });
   }, 15 * 60 * 1000).unref();
 }
 

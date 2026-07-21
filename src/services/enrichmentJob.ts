@@ -153,6 +153,7 @@ export async function runEnrichmentPass(opts?: {
           item_label: r.item_label,
           lending: r.lending,
           category_suggestion: r.category_suggestion,
+          service_identity: r.service_identity ?? null,
           note_hash: noteHash(byId.get(r.id)!.notes),
           model,
           enriched_at: new Date().toISOString(),
