@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { getUserByApiKey } from "../services/supabase.js";
-import { generateMonthlySummary, MonthlyAggregatesSchema } from "../services/monthlySummary.js";
+import { generateMonthlySummary, MonthlyAggregatesSchema, MonthlyCategoryInputSchema } from "../services/monthlySummary.js";
 
 const router = Router();
 
@@ -23,8 +23,14 @@ router.post("/monthly-summary", async (req: Request, res: Response) => {
     return;
   }
 
+  const categories = MonthlyCategoryInputSchema.safeParse(req.body?.categories ?? []);
+  if (!categories.success) {
+    res.status(400).json({ success: false, error: "Invalid categories", details: categories.error.errors });
+    return;
+  }
+
   try {
-    const result = await generateMonthlySummary(user.id, parsed.data);
+    const result = await generateMonthlySummary(user.id, parsed.data, categories.data);
     res.json({ success: true, ...result });
   } catch (err) {
     res.status(500).json({ success: false, error: (err as Error).message });
