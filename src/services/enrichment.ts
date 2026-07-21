@@ -37,6 +37,12 @@ export const EnrichmentResultSchema = z.object({
         .string()
         .nullable()
         .describe("If the note clearly does NOT match current_category, the better category slug from the allowed list. Else null."),
+      service_identity: z
+        .string()
+        .nullable()
+        .describe(
+          "If this spend is a recurring service (streaming, insurance, telecom, cloud/API, gym, EMI, membership), a normalized lowercase service name like 'youtube premium', 'life insurance', 'jio fiber'. Ignore the payment rail (Amazon Pay, UPI) — name the service. Else null."
+        ),
     })
   ),
 });
@@ -64,6 +70,7 @@ Return for each:
   * Aim for a handful of themes per category, meaningful enough to be worth a sub-line. Too granular defeats the purpose.
 - lending: {counterparty, type:'lent'|'repayment'} only if the note indicates money lent to / borrowed from a named person; else null.
 - category_suggestion: if the note clearly contradicts current_category, the better slug from [${categorySlugs.join(", ")}]; else null. Be conservative — only flag clear mismatches.
+- service_identity: if this is a recurring service (streaming, insurance, telecom, cloud/API, gym, EMI, membership), a normalized lowercase service name (e.g. "youtube premium", "life insurance"). Name the service, not the payment rail. Else null.
 
 Existing labels already in use (REUSE these when they fit; invent new only when none fit):
 ${vocabLines || "  (none yet)"}
