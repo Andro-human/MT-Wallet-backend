@@ -35,6 +35,7 @@ async function main() {
     { default: syncRunsRoutes },
     { default: enrichmentRoutes },
     { default: insightsRoutes },
+    { default: reviewRoutes },
     gmailService,
     supabaseService,
     enrichmentJob,
@@ -48,6 +49,7 @@ async function main() {
     import("./routes/sync-runs.js"),
     import("./routes/enrichment.js"),
     import("./routes/insights.js"),
+    import("./routes/review.js"),
     import("./services/gmail.js"),
     import("./services/supabase.js"),
     import("./services/enrichmentJob.js"),
@@ -76,6 +78,7 @@ async function main() {
   app.use("/api/sync-runs", syncRunsRoutes);
   app.use("/api/enrichment", enrichmentRoutes);
   app.use("/api/insights", insightsRoutes);
+  app.use("/api/review", reviewRoutes);
 
   // Root health check
   app.get("/", (_req, res) => {
