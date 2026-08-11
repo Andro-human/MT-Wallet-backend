@@ -36,6 +36,7 @@ async function main() {
     { default: enrichmentRoutes },
     { default: insightsRoutes },
     { default: reviewRoutes },
+    { default: mcpRoutes },
     gmailService,
     supabaseService,
     enrichmentJob,
@@ -50,6 +51,7 @@ async function main() {
     import("./routes/enrichment.js"),
     import("./routes/insights.js"),
     import("./routes/review.js"),
+    import("./routes/mcp.js"),
     import("./services/gmail.js"),
     import("./services/supabase.js"),
     import("./services/enrichmentJob.js"),
@@ -79,6 +81,7 @@ async function main() {
   app.use("/api/enrichment", enrichmentRoutes);
   app.use("/api/insights", insightsRoutes);
   app.use("/api/review", reviewRoutes);
+  app.use("/mcp/:token", mcpRoutes);
 
   // Root health check
   app.get("/", (_req, res) => {
