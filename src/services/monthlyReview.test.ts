@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   reconcilePartition,
   reconcileSubmission,
+  reconcileDays,
   ReviewSubmissionSchema,
   type ReviewPayload,
 } from "./monthlyReview.js";
@@ -184,4 +185,97 @@ test("zero-expense month: empty items reconcile cleanly", () => {
   const r = reconcileSubmission(empty, submit({ items: [] }));
   assert.deepEqual(r.errors, []);
   assert.deepEqual(r.breakdowns, []);
+});
+
+// ─── Day summaries ──────────────────────────────────────────────────────────
+
+const dayPayload = (over: Partial<ReviewPayload["days"][number]> = {}): ReviewPayload => ({
+  month: "2026-08",
+  timezone: "Asia/Kolkata",
+  totals: { spent: 300, income: 0 },
+  items: [],
+  days: [
+    {
+      day: "2026-08-20",
+      total: 300,
+      all_noted: true,
+      notes_fingerprint: "abc123",
+      txns: [
+        { n: 1, d: "2026-08-20", merchant: "Zomato", note: "lunch", amount: 200 },
+        { n: 2, d: "2026-08-20", merchant: "Zepto", note: "milk", amount: 100 },
+      ],
+      ...over,
+    },
+  ],
+  income_lines: [],
+  excluded: { duplicates: 0, fullyRefunded: 0, notCounted: 0 },
+  known_slice_labels: [],
+  known_group_labels: [],
+});
+
+const daySubmission = (summary: string, groups?: any) => ({
+  month: "2026-08",
+  review: { summary: "x", highlights: ["a", "b"], model: "test" },
+  items: [],
+  slices: [],
+  days: [
+    {
+      day: "2026-08-20",
+      summary,
+      groups: groups ?? [
+        { label: "Food delivery", ordinals: [1] },
+        { label: "Groceries", ordinals: [2] },
+      ],
+    },
+  ],
+});
+
+test("day: accepts a reconciling partition with figures the server computed", () => {
+  const errors: string[] = [];
+  const days = reconcileDays(dayPayload(), daySubmission("Food delivery ₹200. Groceries ₹100.") as any, errors);
+  assert.deepEqual(errors, []);
+  assert.equal(days.length, 1);
+  assert.equal(days[0].notes_fingerprint, "abc123");
+  assert.deepEqual(days[0].groups.map((g) => g.amount), [200, 100]);
+});
+
+test("day: rejects a figure the agent invented", () => {
+  const errors: string[] = [];
+  const days = reconcileDays(dayPayload(), daySubmission("Food delivery ₹250. Groceries ₹100.") as any, errors);
+  assert.equal(days.length, 0);
+  assert.ok(errors.some((e) => e.includes("₹250")), errors.join(" | "));
+});
+
+test("day: accepts the day total and a bare transaction amount as figures", () => {
+  const errors: string[] = [];
+  const days = reconcileDays(dayPayload(), daySubmission("Rs300 in all, Rs200 of it delivery.") as any, errors);
+  assert.deepEqual(errors, []);
+  assert.equal(days.length, 1);
+});
+
+test("day: refuses a day that is not fully noted", () => {
+  const errors: string[] = [];
+  const days = reconcileDays(dayPayload({ all_noted: false }), daySubmission("Food delivery ₹200. Groceries ₹100.") as any, errors);
+  assert.equal(days.length, 0);
+  assert.ok(errors.some((e) => e.includes("noted")), errors.join(" | "));
+});
+
+test("day: refuses groups that do not cover the day", () => {
+  const errors: string[] = [];
+  const days = reconcileDays(
+    dayPayload(),
+    daySubmission("Food delivery ₹200.", [{ label: "Food delivery", ordinals: [1] }]) as any,
+    errors,
+  );
+  assert.equal(days.length, 0);
+  assert.ok(errors.some((e) => e.includes("not covered")), errors.join(" | "));
+});
+
+test("day: refuses an unknown date", () => {
+  const errors: string[] = [];
+  const sub = daySubmission("Food delivery ₹200. Groceries ₹100.") as any;
+  sub.days[0].day = "2026-08-19";
+  const days = reconcileDays(dayPayload(), sub, errors);
+  assert.equal(days.length, 0);
+  assert.ok(errors.some((e) => e.includes("not in this month")), errors.join(" | "));
 });
