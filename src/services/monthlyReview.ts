@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { supabase } from "./supabase.js";
 
@@ -41,11 +42,24 @@ export interface PayloadItem {
   total: number;
   txns: PayloadTxn[];
 }
+export interface PayloadDay {
+  day: string;
+  total: number;
+  /** Every counted expense that day carries a note. A summary written from a
+   *  partly-noted day describes the noted half and misrepresents the rest. */
+  all_noted: boolean;
+  /** Digest of the day's notes. Changes when a note is edited, which is the
+   *  signal to rewrite a day already summarised. Keyed on transaction id, not
+   *  ordinal, so inserting an earlier transaction does not invalidate it. */
+  notes_fingerprint: string;
+  txns: PayloadTxn[];
+}
 export interface ReviewPayload {
   month: string;
   timezone: string;
   totals: { spent: number; income: number };
   items: PayloadItem[];
+  days: PayloadDay[];
   income_lines: { d: string; merchant: string | null; note: string | null; amount: number }[];
   excluded: { duplicates: number; fullyRefunded: number; notCounted: number };
   known_slice_labels: string[];
@@ -117,6 +131,7 @@ export async function buildReviewPayload(userId: string, month: string): Promise
   const groupById = new Map(groups.map((g: any) => [g.id, g]));
 
   const itemsByKey = new Map<string, PayloadItem>();
+  const dayAcc = new Map<string, { total: number; txns: PayloadTxn[]; noteKeys: string[]; allNoted: boolean }>();
   const incomeLines: ReviewPayload["income_lines"] = [];
   const excluded = { duplicates: 0, fullyRefunded: 0, notCounted: 0 };
   let totalSpent = 0;
@@ -177,6 +192,15 @@ export async function buildReviewPayload(userId: string, month: string): Promise
     });
     item.total = round2(item.total + net);
     itemsByKey.set(key, item);
+
+    const dayKey = istDay(t.transacted_at);
+    const day = dayAcc.get(dayKey) ?? { total: 0, txns: [], noteKeys: [], allNoted: true };
+    const note = (t.notes ?? "").trim();
+    day.total = round2(day.total + net);
+    day.txns.push({ n, d: dayKey, merchant: t.merchant ?? null, note: t.notes ?? null, amount: net });
+    day.noteKeys.push(`${t.id}:${note}`);
+    if (!note) day.allNoted = false;
+    dayAcc.set(dayKey, day);
   }
 
   const sliceLabels = new Set<string>();
@@ -191,6 +215,18 @@ export async function buildReviewPayload(userId: string, month: string): Promise
     timezone: TZ,
     totals: { spent: totalSpent, income: totalIncome },
     items: [...itemsByKey.values()].sort((a, b) => b.total - a.total),
+    days: [...dayAcc.entries()]
+      .sort((a, b) => (a[0] < b[0] ? 1 : -1))
+      .map(([day, d]) => ({
+        day,
+        total: d.total,
+        all_noted: d.allNoted,
+        notes_fingerprint: createHash("sha256")
+          .update(d.noteKeys.sort().join("\u0000"))
+          .digest("hex")
+          .slice(0, 16),
+        txns: d.txns,
+      })),
     income_lines: incomeLines.sort((a, b) => b.amount - a.amount),
     excluded,
     known_slice_labels: [...sliceLabels].sort(),
@@ -222,6 +258,16 @@ export const ReviewSubmissionSchema = z.object({
     .max(200)
     .default([]),
   slices: z.array(GroupingSchema).max(60).default([]),
+  days: z
+    .array(
+      z.object({
+        day: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        summary: z.string().min(1).max(400),
+        groups: z.array(GroupingSchema).min(1).max(30),
+      }),
+    )
+    .max(31)
+    .default([]),
 });
 export type ReviewSubmission = z.infer<typeof ReviewSubmissionSchema>;
 
@@ -277,6 +323,67 @@ export function reconcilePartition(
   return out.sort((a, b) => b.amount - a.amount);
 }
 
+export interface ReconciledDay {
+  day: string;
+  summary: string;
+  groups: ReconciledGroup[];
+  notes_fingerprint: string;
+}
+
+/** Every rupee figure the agent writes must be one the server just computed:
+ *  a group total, a single transaction, or the day total. Prose is the agent's,
+ *  arithmetic is not. */
+const MONEY_RE = /(?:₹|Rs\.?\s?)\s?([\d,]+(?:\.\d{1,2})?)/g;
+export function verifyFigures(
+  scope: string,
+  summary: string,
+  allowed: number[],
+  errors: string[],
+): void {
+  for (const m of summary.matchAll(MONEY_RE)) {
+    const claimed = Number(m[1].replace(/,/g, ""));
+    if (!Number.isFinite(claimed)) continue;
+    if (!allowed.some((a) => Math.abs(a - claimed) < 0.01)) {
+      pushError(errors, `${scope}: ₹${m[1]} in the summary is not a group total, a transaction, or the day total`);
+    }
+  }
+}
+
+export function reconcileDays(
+  payload: ReviewPayload,
+  submission: ReviewSubmission,
+  errors: string[],
+): ReconciledDay[] {
+  // Tolerate a payload or submission built before days existed rather than
+  // throwing: a missing day list means "no day summaries", not an error.
+  const byDay = new Map((payload.days ?? []).map((d) => [d.day, d]));
+  const out: ReconciledDay[] = [];
+
+  for (const sub of submission.days ?? []) {
+    const day = byDay.get(sub.day);
+    if (!day) {
+      pushError(errors, `day ${sub.day}: not in this month's payload`);
+      continue;
+    }
+    if (!day.all_noted) {
+      pushError(errors, `day ${sub.day}: not every transaction is noted, so it must be left without a summary`);
+      continue;
+    }
+    const byN = new Map(day.txns.map((t) => [t.n, t.amount]));
+    const before = errors.length;
+    const groups = reconcilePartition(`day ${sub.day}`, byN, sub.groups, day.total, errors);
+    verifyFigures(
+      `day ${sub.day}`,
+      sub.summary,
+      [...groups.map((g) => g.amount), ...day.txns.map((t) => t.amount), day.total],
+      errors,
+    );
+    if (errors.length > before) continue;
+    out.push({ day: sub.day, summary: sub.summary, groups, notes_fingerprint: day.notes_fingerprint });
+  }
+  return out;
+}
+
 export interface ReconciledSubmission {
   errors: string[];
   breakdowns: {
@@ -288,6 +395,7 @@ export interface ReconciledSubmission {
     reconciled: boolean;
   }[];
   slices: ReconciledGroup[];
+  days: ReconciledDay[];
 }
 
 /**
@@ -337,7 +445,9 @@ export function reconcileSubmission(
     slices = reconcilePartition("slices", allByN, submission.slices, payload.totals.spent, errors);
   }
 
-  return { errors, breakdowns, slices };
+  const days = reconcileDays(payload, submission, errors);
+
+  return { errors, breakdowns, slices, days };
 }
 
 /**
@@ -348,8 +458,8 @@ export async function storeReview(
   userId: string,
   payload: ReviewPayload,
   submission: ReviewSubmission,
-): Promise<{ errors: string[] } | { stored: true; items: number; slices: number }> {
-  const { errors, breakdowns, slices } = reconcileSubmission(payload, submission);
+): Promise<{ errors: string[] } | { stored: true; items: number; slices: number; days: number }> {
+  const { errors, breakdowns, slices, days } = reconcileSubmission(payload, submission);
   if (errors.length > 0) return { errors };
 
   // A submission without slices means "no slice update", not "clear them" —
@@ -394,9 +504,42 @@ export async function storeReview(
   });
   if (error) throw new Error(`summary upsert failed: ${error.message}`);
 
+  // Never overwrite a hand-authored line. Those were written as the reference
+  // voice, so the agent has to be asked explicitly to replace one.
+  if (days.length > 0) {
+    const { data: manual } = await supabase
+      .from("day_summaries")
+      .select("day")
+      .eq("user_id", userId)
+      .eq("model", "manual")
+      .in("day", days.map((d) => d.day));
+    const protectedDays = new Set((manual ?? []).map((r: any) => r.day));
+
+    const rows = days
+      .filter((d) => !protectedDays.has(d.day))
+      .map((d) => ({
+        user_id: userId,
+        day: d.day,
+        summary: d.summary,
+        notes_fingerprint: d.notes_fingerprint,
+        model: submission.review.model,
+        generated_at: new Date().toISOString(),
+      }));
+
+    if (rows.length > 0) {
+      const { error: dayError } = await supabase
+        .from("day_summaries")
+        .upsert(rows, { onConflict: "user_id,day" });
+      if (dayError) throw new Error(`day_summaries upsert failed: ${dayError.message}`);
+    }
+    if (protectedDays.size > 0) {
+      console.log(`[review] skipped ${protectedDays.size} hand-written day(s): ${[...protectedDays].join(", ")}`);
+    }
+  }
+
   console.log(
     `[review] stored ${payload.month} for ${userId} via ${submission.review.model}: ` +
-      `${breakdowns.length} items, ${storedSlices.length} slices${submission.slices.length === 0 ? " (carried over)" : ""}`,
+      `${breakdowns.length} items, ${storedSlices.length} slices${submission.slices.length === 0 ? " (carried over)" : ""}, ${days.length} days`,
   );
-  return { stored: true, items: breakdowns.length, slices: storedSlices.length };
+  return { stored: true, items: breakdowns.length, slices: storedSlices.length, days: days.length };
 }

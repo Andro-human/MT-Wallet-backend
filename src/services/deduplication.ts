@@ -119,11 +119,13 @@ function sameNotifier(a: CrossChannelCandidate, b: CrossChannelCandidate): boole
 /**
  * Strong-tier auto-merge fingerprint. Two automated-ingest rows are the same payment
  * when amount + direction match within the window, they come from DIFFERENT notifiers,
- * and one strong corroborator holds: the same card (last4), or the same merchant on a
- * compatible bank. Bank name and reference are deliberately NOT required to agree —
- * different notifiers report different banks (HSBC vs Razorpay) and different reference
- * schemes (bank RRN vs Google order id) for the very same payment. Weaker cases
- * (merchant-only, banks differ) are left for the in-app duplicate banner to confirm.
+ * and one strong corroborator holds: the same card (last4), the same merchant on a
+ * compatible bank, or the same merchant with NO account identity on either side
+ * (merchant notifications like BookMyShow refunds carry no bank/last4 at all).
+ * Bank name and reference are deliberately NOT required to agree — different notifiers
+ * report different banks (HSBC vs Razorpay) and different reference schemes (bank RRN
+ * vs Google order id) for the very same payment. Weaker cases (merchant-only where one
+ * side names a bank, banks differ) are left for the in-app duplicate banner to confirm.
  */
 export function matchesCrossChannelFingerprint(
   candidate: CrossChannelCandidate,
@@ -147,16 +149,19 @@ export function matchesCrossChannelFingerprint(
 
   const candidateMerchant = normalizeMerchant(candidate.merchant ?? null);
   const existingMerchant = normalizeMerchant(existing.merchant ?? null);
+  if (!candidateMerchant || !existingMerchant || candidateMerchant !== existingMerchant) {
+    return false;
+  }
+
   const candidateBank = normalizeBankName(c.bank);
   const existingBank = normalizeBankName(e.bank);
-  if (
-    candidateMerchant &&
-    existingMerchant &&
-    candidateMerchant === existingMerchant &&
-    candidateBank &&
-    existingBank &&
-    bankNamesCompatible(candidateBank, existingBank)
-  ) {
+  if (candidateBank && existingBank && bankNamesCompatible(candidateBank, existingBank)) {
+    return true;
+  }
+
+  const candidateHasAccount = Boolean(candidateBank || c.last4);
+  const existingHasAccount = Boolean(existingBank || e.last4);
+  if (!candidateHasAccount && !existingHasAccount) {
     return true;
   }
 
