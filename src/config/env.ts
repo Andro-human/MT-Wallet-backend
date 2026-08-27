@@ -1,8 +1,14 @@
 import "dotenv/config";
 
+// node:test sets NODE_TEST_CONTEXT. Unit tests reach this module transitively
+// (monthlyReview -> supabase -> env) and a pure reconciliation test has no
+// business needing Supabase or AI credentials. The server still fails fast.
+const isTestRun = !!process.env.NODE_TEST_CONTEXT;
+
 function requireEnv(name: string): string {
   const value = process.env[name];
   if (!value) {
+    if (isTestRun) return "";
     console.error(`FATAL: Missing required environment variable: ${name}`);
     // Log all non-npm env var names (not values) for debugging
     const envKeys = Object.keys(process.env)
@@ -19,7 +25,7 @@ function optionalEnv(name: string, defaultValue: string): string {
   return process.env[name] || defaultValue;
 }
 
-console.log("[env] Loading environment variables...");
+if (!isTestRun) console.log("[env] Loading environment variables...");
 
 // Validate all required env vars upfront so we fail fast with a clear message
 // Google is primary; Groq is optional fallback.
@@ -30,7 +36,7 @@ const requiredVars = [
   "GROQ_API_KEY",
 ];
 const missing = requiredVars.filter((name) => !process.env[name]);
-if (missing.length > 0) {
+if (missing.length > 0 && !isTestRun) {
   console.error(`FATAL: Missing required environment variables: ${missing.join(', ')}`);
   const envKeys = Object.keys(process.env)
     .filter(k => !k.startsWith('npm_') && !k.startsWith('_'))

@@ -12,8 +12,15 @@ import {
   type BankAlias,
 } from "./deduplication.js";
 
-// Create Supabase client with service role key (bypasses RLS)
-export const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey);
+// Create Supabase client with service role key (bypasses RLS).
+// The fallbacks only ever apply under node:test, where env.ts returns "" instead
+// of exiting: createClient("") throws at import and would take down any test that
+// transitively reaches this module. A test that actually calls the DB still fails
+// loudly against an unreachable localhost rather than passing quietly.
+export const supabase = createClient(
+  env.supabaseUrl || "http://127.0.0.1:1",
+  env.supabaseServiceRoleKey || "test-no-key",
+);
 
 /**
  * Get user by API key
