@@ -4,6 +4,7 @@ import {
   reconcilePartition,
   reconcileSubmission,
   reconcileDays,
+  daySummaryStatus,
   ReviewSubmissionSchema,
   type ReviewPayload,
 } from "./monthlyReview.js";
@@ -278,4 +279,46 @@ test("day: refuses an unknown date", () => {
   const days = reconcileDays(dayPayload(), sub, errors);
   assert.equal(days.length, 0);
   assert.ok(errors.some((e) => e.includes("not in this month")), errors.join(" | "));
+});
+
+// ─── day summary backfill / staleness ────────────────────────────────────────
+
+test("day status: a fully noted day with no summary is written", () => {
+  const s = daySummaryStatus(true, "abc123", undefined);
+  assert.equal(s.has_summary, false);
+  assert.equal(s.needs_summary, true);
+});
+
+test("day status: a day that is not fully noted is never written", () => {
+  // 26 Aug 2026 sat here: a Rs 17.98 Zomato charge carried no note.
+  assert.equal(daySummaryStatus(false, "abc123", undefined).needs_summary, false);
+  assert.equal(
+    daySummaryStatus(false, "new", { notes_fingerprint: "old", model: "gemini" }).needs_summary,
+    false,
+  );
+});
+
+test("day status: an unchanged day is left alone", () => {
+  const s = daySummaryStatus(true, "abc123", { notes_fingerprint: "abc123", model: "gemini" });
+  assert.equal(s.summary_stale, false);
+  assert.equal(s.needs_summary, false);
+});
+
+test("day status: a changed note or a late refund reopens the day", () => {
+  const s = daySummaryStatus(true, "NEW", { notes_fingerprint: "OLD", model: "gemini" });
+  assert.equal(s.summary_stale, true);
+  assert.equal(s.needs_summary, true);
+});
+
+test("day status: hand-written days are never reopened, even when stale", () => {
+  const s = daySummaryStatus(true, "NEW", { notes_fingerprint: "OLD", model: "manual" });
+  assert.equal(s.summary_locked, true);
+  assert.equal(s.summary_stale, true);
+  assert.equal(s.needs_summary, false);
+});
+
+test("day status: a stored row with a null fingerprint counts as stale", () => {
+  // Rows written before the fingerprint column existed.
+  const s = daySummaryStatus(true, "abc123", { notes_fingerprint: null, model: "gemini" });
+  assert.equal(s.needs_summary, true);
 });

@@ -52,6 +52,16 @@ export interface PayloadDay {
    *  signal to rewrite a day already summarised. Keyed on transaction id, not
    *  ordinal, so inserting an earlier transaction does not invalidate it. */
   notes_fingerprint: string;
+  /** A summary already exists for this day. */
+  has_summary: boolean;
+  /** Stored summary was written against different notes: a note was edited, a
+   *  transaction arrived, or a refund changed the day's total. */
+  summary_stale: boolean;
+  /** Hand-authored. Never overwrite; storeReview refuses these anyway. */
+  summary_locked: boolean;
+  /** The whole decision, resolved by code so the agent does not have to reason
+   *  about fingerprints: write this day if and only if this is true. */
+  needs_summary: boolean;
   txns: PayloadTxn[];
 }
 export interface ReviewPayload {
@@ -84,13 +94,46 @@ async function fetchAll<T>(
   return rows;
 }
 
+export interface StoredDay {
+  notes_fingerprint: string | null;
+  model: string | null;
+}
+
+export interface DaySummaryStatus {
+  has_summary: boolean;
+  summary_stale: boolean;
+  summary_locked: boolean;
+  needs_summary: boolean;
+}
+
+/** Whether the agent should write this day. Backfill and staleness live here so
+ *  the agent never reasons about fingerprints: a day is written when it is fully
+ *  noted, not hand-authored, and either has no summary yet or was summarised
+ *  against different notes. That second case is what lets a late refund or an
+ *  edited note reopen a day that was already done. */
+export function daySummaryStatus(
+  allNoted: boolean,
+  fingerprint: string,
+  stored: StoredDay | undefined,
+): DaySummaryStatus {
+  const has_summary = !!stored;
+  const summary_locked = stored?.model === "manual";
+  const summary_stale = has_summary && stored?.notes_fingerprint !== fingerprint;
+  return {
+    has_summary,
+    summary_stale,
+    summary_locked,
+    needs_summary: allNoted && !summary_locked && (!has_summary || summary_stale),
+  };
+}
+
 export async function buildReviewPayload(userId: string, month: string): Promise<ReviewPayload> {
   const [y, m] = month.split("-").map(Number);
   // Padded UTC window so IST month-edge transactions are never missed.
   const windowStart = new Date(Date.UTC(y, m - 1, 1) - 36 * 3600 * 1000).toISOString();
   const windowEnd = new Date(Date.UTC(y, m, 1) + 36 * 3600 * 1000).toISOString();
 
-  const [txnsRaw, refundLinks, duplicateLinks, categories, groups, priorSummaries] =
+  const [txnsRaw, refundLinks, duplicateLinks, categories, groups, existingDays, priorSummaries] =
     await Promise.all([
       fetchAll<any>(
         "transactions",
@@ -105,6 +148,9 @@ export async function buildReviewPayload(userId: string, month: string): Promise
         q.or(`is_system.eq.true,user_id.eq.${userId}`),
       ),
       fetchAll<any>("transaction_groups", "id, name", (q) => q.eq("user_id", userId)),
+      fetchAll<any>("day_summaries", "day, notes_fingerprint, model", (q) =>
+        q.eq("user_id", userId).gte("day", `${month}-01`).lte("day", `${month}-31`),
+      ),
       supabase
         .from("monthly_summaries")
         .select("month, spend_slices, category_breakdowns")
@@ -203,6 +249,10 @@ export async function buildReviewPayload(userId: string, month: string): Promise
     dayAcc.set(dayKey, day);
   }
 
+  const storedDays = new Map<string, { notes_fingerprint: string | null; model: string | null }>(
+    (existingDays as any[]).map((r) => [r.day, { notes_fingerprint: r.notes_fingerprint, model: r.model }]),
+  );
+
   const sliceLabels = new Set<string>();
   const groupLabels = new Set<string>();
   for (const s of priorSummaries as any[]) {
@@ -217,16 +267,20 @@ export async function buildReviewPayload(userId: string, month: string): Promise
     items: [...itemsByKey.values()].sort((a, b) => b.total - a.total),
     days: [...dayAcc.entries()]
       .sort((a, b) => (a[0] < b[0] ? 1 : -1))
-      .map(([day, d]) => ({
-        day,
-        total: d.total,
-        all_noted: d.allNoted,
-        notes_fingerprint: createHash("sha256")
+      .map(([day, d]) => {
+        const fingerprint = createHash("sha256")
           .update(d.noteKeys.sort().join("\u0000"))
           .digest("hex")
-          .slice(0, 16),
-        txns: d.txns,
-      })),
+          .slice(0, 16);
+        return {
+          day,
+          total: d.total,
+          all_noted: d.allNoted,
+          notes_fingerprint: fingerprint,
+          ...daySummaryStatus(d.allNoted, fingerprint, storedDays.get(day)),
+          txns: d.txns,
+        };
+      }),
     income_lines: incomeLines.sort((a, b) => b.amount - a.amount),
     excluded,
     known_slice_labels: [...sliceLabels].sort(),
