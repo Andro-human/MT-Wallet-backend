@@ -33,6 +33,11 @@ export interface PayloadTxn {
   note: string | null;
   amount: number;
   refunded?: number;
+  /** Combine tag. Transactions the user has combined on the Activity page share
+   *  one tag and are ONE purchase. Absent when the transaction stands alone.
+   *  Without this the agent counts rows: August's review said "37 orders" for a
+   *  set that was 30 once combining was applied. */
+  c?: string;
 }
 export interface PayloadItem {
   key: string;
@@ -133,7 +138,7 @@ export async function buildReviewPayload(userId: string, month: string): Promise
   const windowStart = new Date(Date.UTC(y, m - 1, 1) - 36 * 3600 * 1000).toISOString();
   const windowEnd = new Date(Date.UTC(y, m, 1) + 36 * 3600 * 1000).toISOString();
 
-  const [txnsRaw, refundLinks, duplicateLinks, categories, groups, existingDays, priorSummaries] =
+  const [txnsRaw, refundLinks, duplicateLinks, combinedRows, categories, groups, existingDays, priorSummaries] =
     await Promise.all([
       fetchAll<any>(
         "transactions",
@@ -144,6 +149,9 @@ export async function buildReviewPayload(userId: string, month: string): Promise
         q.eq("user_id", userId),
       ),
       fetchAll<any>("duplicate_links", "duplicate_transaction_id", (q) => q.eq("user_id", userId)),
+      fetchAll<any>("combined_transactions", "combine_id, transaction_id", (q) =>
+        q.eq("user_id", userId),
+      ),
       fetchAll<any>("categories", "id, name, slug", (q) =>
         q.or(`is_system.eq.true,user_id.eq.${userId}`),
       ),
@@ -163,6 +171,21 @@ export async function buildReviewPayload(userId: string, month: string): Promise
           return data ?? [];
         }),
     ]);
+
+  // Short, stable per-payload tags so the agent can see which rows are one
+  // purchase without carrying uuids around.
+  const combineTag = new Map<string, string>();
+  {
+    const seen = new Map<string, string>();
+    for (const r of combinedRows as { combine_id: string; transaction_id: string }[]) {
+      let tag = seen.get(r.combine_id);
+      if (!tag) {
+        tag = `c${seen.size + 1}`;
+        seen.set(r.combine_id, tag);
+      }
+      combineTag.set(r.transaction_id, tag);
+    }
+  }
 
   const refundTotals: Record<string, number> = {};
   const refundAllocations: Record<string, number> = {};
@@ -235,6 +258,7 @@ export async function buildReviewPayload(userId: string, month: string): Promise
       note: t.notes ?? null,
       amount: net,
       ...(refundTotals[t.id] ? { refunded: round2(refundTotals[t.id]) } : {}),
+      ...(combineTag.has(t.id) ? { c: combineTag.get(t.id)! } : {}),
     });
     item.total = round2(item.total + net);
     itemsByKey.set(key, item);
@@ -243,7 +267,14 @@ export async function buildReviewPayload(userId: string, month: string): Promise
     const day = dayAcc.get(dayKey) ?? { total: 0, txns: [], noteKeys: [], allNoted: true };
     const note = (t.notes ?? "").trim();
     day.total = round2(day.total + net);
-    day.txns.push({ n, d: dayKey, merchant: t.merchant ?? null, note: t.notes ?? null, amount: net });
+    day.txns.push({
+      n,
+      d: dayKey,
+      merchant: t.merchant ?? null,
+      note: t.notes ?? null,
+      amount: net,
+      ...(combineTag.has(t.id) ? { c: combineTag.get(t.id)! } : {}),
+    });
     day.noteKeys.push(`${t.id}:${note}`);
     if (!note) day.allNoted = false;
     dayAcc.set(dayKey, day);
