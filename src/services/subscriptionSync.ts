@@ -51,6 +51,7 @@ function amountProximity(a: number, b: number | null): number {
 
 interface CandidateTxn {
   id: string;
+  direction: string | null;
   merchant: string | null;
   notes: string | null;
   amount: number;
@@ -104,7 +105,8 @@ async function recomputeSubscription(subscriptionId: string) {
   const { data, error } = await supabase
     .from("subscription_transactions")
     .select("amount, transacted_at")
-    .eq("subscription_id", subscriptionId);
+    .eq("subscription_id", subscriptionId)
+    .eq("kind", "charge");
   if (error) throw new Error(error.message);
   const occ = (data ?? []).map((o: any) => ({ amount: Number(o.amount), transacted_at: o.transacted_at }));
   const amounts = occ.map((o) => o.amount);
@@ -163,9 +165,10 @@ export async function reconcileSubscriptions(): Promise<{ linked: number; apport
 
     const txnRows = await loadAllRows("transactions", "id, merchant, notes, amount, transacted_at, direction", userId);
     const candidates: CandidateTxn[] = txnRows
-      .filter((t: any) => t.direction === "debit" && !alreadyLinked.has(t.id) && norm(t.notes) !== "")
+      .filter((t: any) => !alreadyLinked.has(t.id) && norm(t.notes) !== "")
       .map((t: any) => ({
         id: t.id,
+        direction: t.direction ?? null,
         merchant: t.merchant,
         notes: t.notes,
         amount: Number(t.amount),
@@ -192,6 +195,7 @@ export async function reconcileSubscriptions(): Promise<{ linked: number; apport
           user_id: userId,
           amount: txn.amount,
           transacted_at: txn.transacted_at,
+          kind: txn.direction === "credit" ? "contribution" : "charge",
           linked_by: "auto",
         },
         { onConflict: "transaction_id" },
@@ -208,7 +212,8 @@ export async function reconcileSubscriptions(): Promise<{ linked: number; apport
       const { data: rows, error: rowsErr } = await supabase
         .from("subscription_transactions")
         .select("transaction_id, amount, attribution_set_by, transactions(notes, amount)")
-        .eq("subscription_id", s.id);
+        .eq("subscription_id", s.id)
+        .eq("kind", "charge");
       if (rowsErr) throw new Error(`occurrences load failed: ${rowsErr.message}`);
       const occurrences = (rows ?? []).map((r: any) => ({
         transactionId: r.transaction_id,
