@@ -6,6 +6,7 @@ import {
   reconcileDays,
   daySummaryStatus,
   ReviewSubmissionSchema,
+  isEffectivelyNoted,
   type ReviewPayload,
 } from "./monthlyReview.js";
 
@@ -321,4 +322,19 @@ test("day status: a stored row with a null fingerprint counts as stale", () => {
   // Rows written before the fingerprint column existed.
   const s = daySummaryStatus(true, "abc123", { notes_fingerprint: null, model: "gemini" });
   assert.equal(s.needs_summary, true);
+});
+
+test("a combined purchase counts as noted from the row that carries the note", () => {
+  // The food order has the note, the delivery fee billed seconds later does not.
+  const noted = new Set(["c1"]);
+  assert.equal(isEffectivelyNoted("chicken thali", "c1", noted), true);
+  assert.equal(isEffectivelyNoted("", "c1", noted), true);
+});
+
+test("an uncombined row with no note still blocks the day", () => {
+  assert.equal(isEffectivelyNoted("", undefined, new Set(["c1"])), false);
+});
+
+test("a combined purchase where nothing carries a note still blocks the day", () => {
+  assert.equal(isEffectivelyNoted("", "c2", new Set(["c1"])), false);
 });
