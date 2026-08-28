@@ -26,6 +26,13 @@ export const EnrichmentItemSchema = z.object({
 
 export const EnrichmentSubmissionSchema = z.object({
   model: z.string().trim().min(1).max(80),
+  // Echo of the cutoff the agent fetched with. Submit has to rebuild the same
+  // offered set from scratch; without the echo, every item of a backfill run
+  // comes back rejected as never-offered.
+  relabel_before: z
+    .string()
+    .refine((s) => Number.isFinite(Date.parse(s)), "not a parsable date")
+    .optional(),
   items: z.array(EnrichmentItemSchema).max(2000),
 });
 
