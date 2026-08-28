@@ -1,4 +1,5 @@
 import { supabase } from "./supabase.js";
+import { proposeAttributions } from "./clubbedDetect.js";
 
 // Backend copy of the frontend matcher + occurrence-summary. The two repos don't
 // share a package, so this mirrors MT-Wallet/src/lib/subscription{Match,Compute}.ts.
@@ -59,6 +60,7 @@ interface CandidateTxn {
 
 interface Sub {
   id: string;
+  label: string | null;
   match_note: string | null;
   match_merchant: string | null;
   identity: string | null;
@@ -135,13 +137,13 @@ async function recomputeSubscription(subscriptionId: string) {
 // (deterministic, HIGH only), then re-predict the affected subscriptions. Client
 // note-edit already links live; this catches anything missed and applies the
 // service_identity signal that only exists after enrichment.
-export async function reconcileSubscriptions(): Promise<{ linked: number; users: number }> {
+export async function reconcileSubscriptions(): Promise<{ linked: number; apportioned: number; users: number }> {
   const { data: subs, error } = await supabase
     .from("subscriptions")
-    .select("id, user_id, match_note, match_merchant, identity, median_amount")
+    .select("id, user_id, label, match_note, match_merchant, identity, median_amount")
     .eq("status", "active");
   if (error) throw new Error(`subscriptions load failed: ${error.message}`);
-  if (!subs || subs.length === 0) return { linked: 0, users: 0 };
+  if (!subs || subs.length === 0) return { linked: 0, apportioned: 0, users: 0 };
 
   const byUser = new Map<string, Sub[]>();
   for (const s of subs as any[]) {
@@ -149,6 +151,7 @@ export async function reconcileSubscriptions(): Promise<{ linked: number; users:
   }
 
   let linked = 0;
+  let apportioned = 0;
   for (const [userId, userSubs] of byUser) {
     const linkedRows = await loadAllRows("subscription_transactions", "transaction_id", userId);
     const alreadyLinked = new Set(linkedRows.map((r: any) => r.transaction_id));
@@ -198,8 +201,41 @@ export async function reconcileSubscriptions(): Promise<{ linked: number; users:
       linked++;
     }
 
+    // Apportion bundled orders. Runs over every active subscription, not just
+    // the ones touched above, because a bundle linked weeks ago is still
+    // overstating its subscription today.
+    for (const s of userSubs) {
+      const { data: rows, error: rowsErr } = await supabase
+        .from("subscription_transactions")
+        .select("transaction_id, amount, attribution_set_by, transactions(notes, amount)")
+        .eq("subscription_id", s.id);
+      if (rowsErr) throw new Error(`occurrences load failed: ${rowsErr.message}`);
+      const occurrences = (rows ?? []).map((r: any) => ({
+        transactionId: r.transaction_id,
+        note: r.transactions?.notes ?? null,
+        txnAmount: Number(r.transactions?.amount ?? r.amount),
+        attributed: Number(r.amount),
+        attributionSetBy: r.attribution_set_by ?? null,
+      }));
+
+      const { proposals } = proposeAttributions(occurrences, s.match_note ?? s.label ?? null);
+      for (const p of proposals) {
+        const { error: attrErr } = await supabase
+          .from("subscription_transactions")
+          .update({ amount: p.to, attribution_set_by: "routine" })
+          .eq("subscription_id", s.id)
+          .eq("transaction_id", p.transactionId);
+        if (attrErr) throw new Error(`attribution failed: ${attrErr.message}`);
+        apportioned++;
+        affected.add(s.id);
+      }
+    }
+
     for (const id of affected) await recomputeSubscription(id);
   }
 
-  return { linked, users: byUser.size };
+  if (apportioned > 0) {
+    console.log(`[subscriptions] apportioned ${apportioned} bundled order(s) to the typical amount`);
+  }
+  return { linked, apportioned, users: byUser.size };
 }
