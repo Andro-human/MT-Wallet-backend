@@ -48,7 +48,7 @@ router.post("/proposals", async (req: Request, res: Response) => {
   }
 
   try {
-    const result = await storeProposals(user.id, windowParam(req.body?.window), parsed.data);
+    const result = await storeProposals(user.id, parsed.data);
     res.json({ success: true, ...result });
   } catch (err) {
     res.status(500).json({ success: false, error: (err as Error).message });

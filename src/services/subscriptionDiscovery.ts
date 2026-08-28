@@ -30,6 +30,8 @@ export interface DiscoveryMerchant {
 }
 export interface DiscoveryPayload {
   window: { from: string; to: string };
+  /** Echo this back when submitting. Ordinals are positions within this window. */
+  window_months: number;
   existing: {
     label: string;
     cadence: string | null;
@@ -196,6 +198,7 @@ export async function buildDiscovery(
 
   const payload: DiscoveryPayload = {
     window: { from, to: new Date().toISOString().slice(0, 10) },
+    window_months: months,
     existing: (subs as any[]).map((s) => ({
       label: s.label,
       cadence: s.cadence,
@@ -258,6 +261,11 @@ async function loadLinkedFacts(
 
 export const ProposalSubmissionSchema = z.object({
   model: z.string().max(80).default("claude-routine"),
+  /** The window the payload was read with. Ordinals are positions in that
+   *  window, so submitting against a different one names different
+   *  transactions. Echoed back rather than defaulted, because a silent
+   *  mismatch links the wrong rows and looks like a correct proposal. */
+  window: z.number().int().min(3).max(60),
   proposals: z
     .array(
       z.object({
@@ -330,12 +338,21 @@ export function resolveProposals(
 
 export async function storeProposals(
   userId: string,
-  windowMonths: number,
   submission: ProposalSubmission,
 ): Promise<{ stored: number; outcomes: ProposalOutcome[] }> {
-  const { payload, idByOrdinal } = await buildDiscovery(userId, windowMonths);
+  const { payload, idByOrdinal } = await buildDiscovery(userId, submission.window);
   const { rows, outcomes } = resolveProposals(payload, submission, new Date());
   if (rows.length === 0) return { stored: 0, outcomes };
+
+  // An ordinal that resolves to nothing means the window shifted under the
+  // agent. Dropping it silently would store a proposal whose occurrence count
+  // does not match the rows it names.
+  const unresolved = rows.flatMap((r: any) =>
+    r.ordinals.filter((o: number) => !idByOrdinal.has(o)).map((o: number) => `${r.label}:${o}`),
+  );
+  if (unresolved.length > 0) {
+    throw new Error(`ordinals no longer resolve to transactions: ${unresolved.join(", ")}`);
+  }
 
   const insert = rows.map((r) => ({
     user_id: userId,
@@ -352,7 +369,7 @@ export async function storeProposals(
     predicted_next: r.predicted_next,
     confidence: r.confidence,
     rationale: r.rationale,
-    transaction_ids: r.ordinals.map((o: number) => idByOrdinal.get(o)).filter(Boolean),
+    transaction_ids: r.ordinals.map((o: number) => idByOrdinal.get(o)!),
     model: submission.model,
   }));
 

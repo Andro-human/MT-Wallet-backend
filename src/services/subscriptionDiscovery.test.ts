@@ -104,7 +104,8 @@ const payload = (): { merchants: DiscoveryMerchant[] } => ({
   ],
 });
 
-const submit = (proposals: unknown[]) => ProposalSubmissionSchema.parse({ proposals });
+const submit = (proposals: unknown[]) =>
+  ProposalSubmissionSchema.parse({ proposals, window: 24 });
 
 test("a well-formed proposal is scored and kept", () => {
   const { rows, outcomes } = resolveProposals(
@@ -168,4 +169,12 @@ test("an empty submission stores nothing and errors on nothing", () => {
 
 test("fewer than three ordinals is rejected at the schema, before any scoring", () => {
   assert.throws(() => submit([{ label: "Netflix", ordinals: [1, 2] }]));
+});
+
+test("a submission without the window it was read against is rejected", () => {
+  // Ordinals are positions in a window. Defaulting one here would silently
+  // link whichever transactions happen to sit at those positions today.
+  assert.throws(() =>
+    ProposalSubmissionSchema.parse({ proposals: [{ label: "X", ordinals: [1, 2, 3] }] }),
+  );
 });
