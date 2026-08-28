@@ -196,6 +196,9 @@ export async function buildReviewPayload(userId: string, month: string): Promise
   // Padded UTC window so IST month-edge transactions are never missed.
   const windowStart = new Date(Date.UTC(y, m - 1, 1) - 36 * 3600 * 1000).toISOString();
   const windowEnd = new Date(Date.UTC(y, m, 1) + 36 * 3600 * 1000).toISOString();
+  // Half-open, because `${month}-31` is not a date in a 30-day month and
+  // Postgres rejects the whole query rather than clamping it.
+  const nextMonthFirst = new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 10);
 
   const [
     txnsRaw,
@@ -225,7 +228,7 @@ export async function buildReviewPayload(userId: string, month: string): Promise
       ),
       fetchAll<any>("transaction_groups", "id, name", (q) => q.eq("user_id", userId)),
       fetchAll<any>("day_summaries", "day, notes_fingerprint, model", (q) =>
-        q.eq("user_id", userId).gte("day", `${month}-01`).lte("day", `${month}-31`),
+        q.eq("user_id", userId).gte("day", `${month}-01`).lt("day", nextMonthFirst),
       ),
       supabase
         .from("monthly_summaries")
