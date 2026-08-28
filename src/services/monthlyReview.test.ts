@@ -8,6 +8,7 @@ import {
   ReviewSubmissionSchema,
   isEffectivelyNoted,
   type ReviewPayload,
+  type StoredBreakdown,
 } from "./monthlyReview.js";
 
 const txns = new Map<number, number>([
@@ -98,7 +99,8 @@ test("error list is capped", () => {
   assert.ok(errors.some((e) => e.includes("truncated")));
 });
 
-function makePayload(): ReviewPayload {
+function makePayload(over: { needsRegen?: boolean } = {}): ReviewPayload {
+  const needs_regen = over.needsRegen ?? true;
   return {
     month: "2026-07",
     timezone: "Asia/Kolkata",
@@ -110,6 +112,8 @@ function makePayload(): ReviewPayload {
         name: "A",
         slug: "a",
         total: 100,
+        fingerprint: "fp-a",
+        needs_regen,
         txns: [{ n: 1, d: "2026-07-01", merchant: null, note: null, amount: 100 }],
       },
       {
@@ -118,6 +122,8 @@ function makePayload(): ReviewPayload {
         name: "B",
         slug: null,
         total: 100,
+        fingerprint: "fp-b",
+        needs_regen,
         txns: [{ n: 2, d: "2026-07-02", merchant: null, note: null, amount: 100 }],
       },
     ],
@@ -131,7 +137,7 @@ function makePayload(): ReviewPayload {
 const submit = (over: Record<string, unknown>) =>
   ReviewSubmissionSchema.parse({
     month: "2026-07",
-    review: { summary: "s", highlights: ["a", "b"] },
+    review: { highlights: ["a", "b"] },
     items: [
       { key: "cat:a", groups: [{ label: "x", ordinals: [1] }] },
       { key: "group:b", groups: [{ label: "y", ordinals: [2] }] },
@@ -189,6 +195,92 @@ test("zero-expense month: empty items reconcile cleanly", () => {
   assert.deepEqual(r.breakdowns, []);
 });
 
+// ─── Partial regeneration ───────────────────────────────────────────────────
+
+const storedA = (over: Partial<StoredBreakdown> = {}): StoredBreakdown => ({
+  category: "a",
+  name: "A",
+  total: 100,
+  one_liner: "Last month's line",
+  groups: [{ label: "x", amount: 100, count: 1 }],
+  fingerprint: "fp-a",
+  ...over,
+});
+
+const onlyB = { items: [{ key: "group:b", groups: [{ label: "y", ordinals: [2] }] }] };
+
+test("an unchanged item is carried forward when the agent leaves it out", () => {
+  const r = reconcileSubmission(makePayload({ needsRegen: false }), submit(onlyB), [storedA()]);
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.carried, 1);
+  const a = r.breakdowns.find((b) => b.category === "a")!;
+  assert.equal(a.one_liner, "Last month's line");
+  assert.deepEqual(a.groups, [{ label: "x", amount: 100, count: 1 }]);
+});
+
+test("a changed item left out is an error, never a silent carry-over", () => {
+  // A stored breakdown exists, but its fingerprint no longer matches the month.
+  const r = reconcileSubmission(makePayload({ needsRegen: true }), submit(onlyB), [storedA()]);
+  assert.ok(r.errors.some((e) => e.includes("A (cat:a): no grouping submitted")), r.errors.join(" | "));
+  assert.equal(r.carried, 0);
+});
+
+test("an unchanged item with nothing stored is still an error", () => {
+  const r = reconcileSubmission(makePayload({ needsRegen: false }), submit(onlyB), []);
+  assert.ok(r.errors.some((e) => e.includes("A (cat:a): no grouping submitted")), r.errors.join(" | "));
+});
+
+test("a stored breakdown whose total no longer matches is refused", () => {
+  // Belt and braces: needs_regen says unchanged but the figures disagree, which
+  // would publish a total that no longer sums from the month's transactions.
+  const r = reconcileSubmission(makePayload({ needsRegen: false }), submit(onlyB), [
+    storedA({ total: 90 }),
+  ]);
+  assert.ok(r.errors.some((e) => e.includes("stored breakdown totals")), r.errors.join(" | "));
+  assert.equal(r.carried, 0);
+});
+
+test("a carried breakdown takes the category's current name", () => {
+  const payload = makePayload({ needsRegen: false });
+  payload.items[0].name = "Food & Dining";
+  const r = reconcileSubmission(payload, submit(onlyB), [storedA()]);
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.breakdowns.find((b) => b.category === "a")!.name, "Food & Dining");
+});
+
+test("every breakdown is stamped with the fingerprint it was built from", () => {
+  const r = reconcileSubmission(makePayload({ needsRegen: false }), submit(onlyB), [storedA()]);
+  assert.deepEqual(
+    r.breakdowns.map((b) => b.fingerprint).sort(),
+    ["fp-a", "fp-b"],
+  );
+});
+
+test("a group item is carried by its group key, not a slug", () => {
+  const stored: StoredBreakdown = {
+    category: "group:b",
+    name: "B",
+    total: 100,
+    one_liner: null,
+    groups: [{ label: "y", amount: 100, count: 1 }],
+    fingerprint: "fp-b",
+  };
+  const r = reconcileSubmission(
+    makePayload({ needsRegen: false }),
+    submit({ items: [{ key: "cat:a", groups: [{ label: "x", ordinals: [1] }] }] }),
+    [stored],
+  );
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.carried, 1);
+});
+
+test("submitting an item that did not need regenerating is still accepted", () => {
+  const r = reconcileSubmission(makePayload({ needsRegen: false }), submit({}), [storedA()]);
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.carried, 0);
+  assert.equal(r.breakdowns.find((b) => b.category === "a")!.one_liner, null);
+});
+
 // ─── Day summaries ──────────────────────────────────────────────────────────
 
 const dayPayload = (over: Partial<ReviewPayload["days"][number]> = {}): ReviewPayload => ({
@@ -217,7 +309,7 @@ const dayPayload = (over: Partial<ReviewPayload["days"][number]> = {}): ReviewPa
 
 const daySubmission = (summary: string, groups?: any) => ({
   month: "2026-08",
-  review: { summary: "x", highlights: ["a", "b"], model: "test" },
+  review: { highlights: ["a", "b"], model: "test" },
   items: [],
   slices: [],
   days: [

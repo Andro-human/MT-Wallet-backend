@@ -34,7 +34,6 @@ async function main() {
     { default: importRoutes },
     { default: syncRunsRoutes },
     { default: enrichmentRoutes },
-    { default: insightsRoutes },
     { default: reviewRoutes },
     { default: mcpRoutes },
     gmailService,
@@ -48,7 +47,6 @@ async function main() {
     import("./routes/import.js"),
     import("./routes/sync-runs.js"),
     import("./routes/enrichment.js"),
-    import("./routes/insights.js"),
     import("./routes/review.js"),
     import("./routes/mcp.js"),
     import("./services/gmail.js"),
@@ -77,7 +75,6 @@ async function main() {
   app.use("/api/import", importRoutes);
   app.use("/api/sync-runs", syncRunsRoutes);
   app.use("/api/enrichment", enrichmentRoutes);
-  app.use("/api/insights", insightsRoutes);
   app.use("/api/review", reviewRoutes);
   app.use("/mcp/:token", mcpRoutes);
 
