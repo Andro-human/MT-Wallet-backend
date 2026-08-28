@@ -39,7 +39,6 @@ async function main() {
     { default: mcpRoutes },
     gmailService,
     supabaseService,
-    enrichmentJob,
     subscriptionSync,
   ] = await Promise.all([
     import("express"),
@@ -54,7 +53,6 @@ async function main() {
     import("./routes/mcp.js"),
     import("./services/gmail.js"),
     import("./services/supabase.js"),
-    import("./services/enrichmentJob.js"),
     import("./services/subscriptionSync.js"),
   ]);
 
@@ -155,25 +153,25 @@ async function main() {
   // Renew every 24h thereafter. Setting unref so it doesn't keep the process alive in tests.
   setInterval(() => { void ensureGmailWatch(); }, ONE_DAY_MS).unref();
 
-  // ── Nightly enrichment (Layer B) ──────────────────────────────────────────
-  // Runs once per IST day during the 02:00 IST hour. Checking every 15 min
+  // ── Nightly subscription reconcile ────────────────────────────────────────
+  // 04:00 IST, after the Claude routine's 03:00 enrichment submission, so a
+  // service_identity written tonight gets linked tonight. Checking every 15 min
   // (instead of a single daily timer) survives restarts and clock drift; the
-  // pass itself is idempotent, so a duplicate trigger enriches nothing.
-  const ENRICH_HOUR_IST = 2;
-  let lastEnrichDay = "";
+  // reconcile is idempotent, so a duplicate trigger links nothing.
+  const RECONCILE_HOUR_IST = 4;
+  let lastReconcileDay = "";
   setInterval(() => {
     const ist = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
     const day = ist.toISOString().slice(0, 10);
-    if (ist.getUTCHours() !== ENRICH_HOUR_IST || lastEnrichDay === day) return;
-    lastEnrichDay = day;
-    enrichmentJob
-      .runEnrichmentPass()
-      .then(() => subscriptionSync.reconcileSubscriptions())
+    if (ist.getUTCHours() !== RECONCILE_HOUR_IST || lastReconcileDay === day) return;
+    lastReconcileDay = day;
+    subscriptionSync
+      .reconcileSubscriptions()
       .then((r) => {
         if (r.linked > 0) console.log(`[subscriptions] reconcile linked ${r.linked} txn(s) across ${r.users} user(s)`);
       })
       .catch((err: Error) => {
-        console.error("[enrichment] nightly pass failed:", err.message);
+        console.error("[subscriptions] nightly reconcile failed:", err.message);
       });
   }, 15 * 60 * 1000).unref();
 }
