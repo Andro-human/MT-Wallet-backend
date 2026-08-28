@@ -116,6 +116,22 @@ export interface DaySummaryStatus {
  *  noted, not hand-authored, and either has no summary yet or was summarised
  *  against different notes. That second case is what lets a late refund or an
  *  edited note reopen a day that was already done. */
+/** Whether a transaction counts as noted for the purposes of writing a day.
+ *
+ *  A combined purchase carries its note on one row: the food order has it, the
+ *  delivery fee billed seconds later does not. Judging each row alone marked the
+ *  fee unnoted and blocked the whole day, which is why 26 Aug never got a
+ *  summary despite the only real purchase being described.
+ */
+export function isEffectivelyNoted(
+  note: string,
+  combineTag: string | undefined,
+  notedCombineTags: Set<string>,
+): boolean {
+  if (note) return true;
+  return !!combineTag && notedCombineTags.has(combineTag);
+}
+
 export function daySummaryStatus(
   allNoted: boolean,
   fingerprint: string,
@@ -185,6 +201,12 @@ export async function buildReviewPayload(userId: string, month: string): Promise
       }
       combineTag.set(r.transaction_id, tag);
     }
+  }
+
+  const notedCombineTags = new Set<string>();
+  for (const t of txnsRaw as any[]) {
+    const tag = combineTag.get(t.id);
+    if (tag && (t.notes ?? "").trim()) notedCombineTags.add(tag);
   }
 
   const refundTotals: Record<string, number> = {};
@@ -276,7 +298,9 @@ export async function buildReviewPayload(userId: string, month: string): Promise
       ...(combineTag.has(t.id) ? { c: combineTag.get(t.id)! } : {}),
     });
     day.noteKeys.push(`${t.id}:${note}`);
-    if (!note) day.allNoted = false;
+    if (!isEffectivelyNoted(note, combineTag.get(t.id), notedCombineTags)) {
+      day.allNoted = false;
+    }
     dayAcc.set(dayKey, day);
   }
 
