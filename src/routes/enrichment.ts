@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { getUserByApiKey } from "../services/supabase.js";
-import { runEnrichmentPass, selectPendingEnrichment, noteHash } from "../services/enrichmentJob.js";
+import { selectPendingEnrichment, noteHash } from "../services/enrichmentPending.js";
 import { supabase } from "../services/supabase.js";
 import {
   EnrichmentSubmissionSchema,
@@ -8,31 +8,6 @@ import {
 } from "../services/enrichmentSubmit.js";
 
 const router = Router();
-
-// Manual trigger for the nightly enrichment pass (testing / catch-up).
-router.post("/run", async (req: Request, res: Response) => {
-  const raw = req.headers["x-api-key"];
-  const apiKey = Array.isArray(raw) ? raw[0] : raw;
-  if (!apiKey) {
-    res.status(401).json({ success: false, error: "Missing x-api-key header" });
-    return;
-  }
-  const user = await getUserByApiKey(apiKey);
-  if (!user) {
-    res.status(401).json({ success: false, error: "Invalid API key" });
-    return;
-  }
-
-  try {
-    const result = await runEnrichmentPass({
-      limit: typeof req.body?.limit === "number" ? req.body.limit : undefined,
-      maxRupees: typeof req.body?.max_rupees === "number" ? req.body.max_rupees : undefined,
-    });
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: (err as Error).message });
-  }
-});
 
 async function authed(req: Request, res: Response) {
   const raw = req.headers["x-api-key"] ?? req.query.api_key;
@@ -49,27 +24,40 @@ async function authed(req: Request, res: Response) {
   return user;
 }
 
+function categorySlugs(userId: string) {
+  return supabase.from("categories").select("slug, name").or(`is_system.eq.true,user_id.eq.${userId}`);
+}
+
 /** Transactions needing enrichment, for the nightly agent.
  *
- *  Same selection the Gemini pass used: a noted transaction with no enrichment
- *  row, or one whose note changed since (note_hash mismatch). The agent gets the
- *  note, merchant, amount and current category, plus the category vocabulary,
- *  which is everything the old prompt was given.
+ *  A noted transaction with no enrichment row, or one whose note changed since
+ *  (note_hash mismatch). Pass relabel_before to also re-offer rows enriched
+ *  before that instant, which is how a field added after the fact gets
+ *  backfilled. The agent gets the note, merchant, amount and current category,
+ *  plus the category vocabulary.
  */
 router.get("/pending", async (req: Request, res: Response) => {
   const user = await authed(req, res);
   if (!user) return;
 
   const limit = Math.min(Number(req.query.limit ?? 300) || 300, 1000);
+  const raw = req.query.relabel_before;
+  const relabelBefore = typeof raw === "string" && raw ? raw : undefined;
+  if (relabelBefore && !Number.isFinite(Date.parse(relabelBefore))) {
+    res.status(422).json({ success: false, error: `relabel_before is not a parsable date: "${relabelBefore}"` });
+    return;
+  }
+
   try {
     const [pending, cats] = await Promise.all([
-      selectPendingEnrichment(limit),
-      supabase.from("categories").select("slug, name").or(`is_system.eq.true,user_id.eq.${user.id}`),
+      selectPendingEnrichment(limit, relabelBefore),
+      categorySlugs(user.id),
     ]);
     const mine = pending.filter((p) => p.user_id === user.id);
     res.json({
       success: true,
       known_category_slugs: (cats.data ?? []).map((c: { slug: string }) => c.slug).sort(),
+      relabel_before: relabelBefore ?? null,
       count: mine.length,
       transactions: mine.map((p) => ({
         id: p.id,
@@ -101,9 +89,11 @@ router.post("/submit", async (req: Request, res: Response) => {
   }
 
   try {
+    // Same cutoff the agent fetched with, or its ids would not be in the
+    // offered set and a whole backfill batch would come back rejected.
     const [pending, cats] = await Promise.all([
-      selectPendingEnrichment(1000),
-      supabase.from("categories").select("slug").or(`is_system.eq.true,user_id.eq.${user.id}`),
+      selectPendingEnrichment(1000, parsed.data.relabel_before),
+      categorySlugs(user.id),
     ]);
     const mine = pending.filter((p) => p.user_id === user.id);
     const offered = new Set(mine.map((p) => p.id));
@@ -115,6 +105,18 @@ router.post("/submit", async (req: Request, res: Response) => {
       return;
     }
 
+    // budget_excluded is the user's alone; the agent never proposes it. Carried
+    // forward explicitly rather than trusting an omitted column to survive the
+    // upsert. Reading only the true rows keeps this off the URL-length cliff an
+    // .in() over a thousand uuids would hit.
+    const { data: excludedRows, error: exErr } = await supabase
+      .from("txn_enrichment")
+      .select("transaction_id")
+      .eq("user_id", user.id)
+      .eq("budget_excluded", true);
+    if (exErr) throw new Error(`budget_excluded read failed: ${exErr.message}`);
+    const excluded = new Set((excludedRows ?? []).map((r: { transaction_id: string }) => r.transaction_id));
+
     const noteById = new Map(mine.map((p) => [p.id, p.notes]));
     // The hash is what marks a row enriched, so it must be the note the agent
     // was actually shown. Recomputing from a note edited mid-run would mark the
@@ -125,6 +127,7 @@ router.post("/submit", async (req: Request, res: Response) => {
       lending: a.lending,
       category_suggestion: a.category_suggestion,
       service_identity: a.service_identity,
+      budget_excluded: excluded.has(a.id),
       note_hash: noteHash(noteById.get(a.id) ?? ""),
       model: parsed.data.model,
       enriched_at: new Date().toISOString(),
