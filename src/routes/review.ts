@@ -7,6 +7,7 @@ import {
   ReviewSubmissionSchema,
   MONTH_RE,
 } from "../services/monthlyReview.js";
+import { findStaleMonths } from "../services/staleMonths.js";
 
 const router = Router();
 
@@ -45,6 +46,22 @@ router.get("/payload", async (req: Request, res: Response) => {
   try {
     const payload = await buildReviewPayload(user.id, month);
     res.json({ success: true, payload });
+  } catch (err) {
+    res.status(500).json({ success: false, error: (err as Error).message });
+  }
+});
+
+router.get("/stale", async (req: Request, res: Response) => {
+  const user = await authenticate(req, res);
+  if (!user) return;
+
+  const num = (v: unknown) => (typeof v === "string" && /^\d+$/.test(v) ? Number(v) : undefined);
+  try {
+    const report = await findStaleMonths(user.id, {
+      windowMonths: num(req.query.window),
+      limit: num(req.query.limit),
+    });
+    res.json({ success: true, ...report });
   } catch (err) {
     res.status(500).json({ success: false, error: (err as Error).message });
   }

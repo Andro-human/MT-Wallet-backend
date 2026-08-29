@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { getUserByApiKey } from "../services/supabase.js";
-import { selectPendingEnrichment, noteHash } from "../services/enrichmentPending.js";
+import { selectPendingEnrichment, noteHash, maySuggestCategory } from "../services/enrichmentPending.js";
+import { linkToSubscriptions } from "../services/enrichmentLink.js";
 import { supabase } from "../services/supabase.js";
 import {
   EnrichmentSubmissionSchema,
@@ -28,6 +29,46 @@ function categorySlugs(userId: string) {
   return supabase.from("categories").select("slug, name").or(`is_system.eq.true,user_id.eq.${userId}`);
 }
 
+/** The subscriptions the agent chooses from, each with the merchant spellings
+ *  already attached to it. Answering "is this one of these?" only works if the
+ *  list is in front of it; without that the agent wrote a service name as free
+ *  text and the server tried to match the string back, which is how a charge
+ *  spelled "policy bazzar" reached Life Insurance by luck rather than by
+ *  reading. */
+async function subscriptionChoices(userId: string) {
+  const [{ data: subs, error }, { data: links, error: linkErr }] = await Promise.all([
+    supabase
+      .from("subscriptions")
+      .select("id, label, cadence, median_amount")
+      .eq("user_id", userId)
+      .eq("status", "active"),
+    supabase
+      .from("subscription_transactions")
+      .select("subscription_id, transactions(merchant)")
+      .eq("user_id", userId)
+      .eq("kind", "charge"),
+  ]);
+  if (error) throw new Error(`subscriptions: ${error.message}`);
+  if (linkErr) throw new Error(`subscription_transactions: ${linkErr.message}`);
+
+  const merchants = new Map<string, Set<string>>();
+  for (const l of (links ?? []) as any[]) {
+    const m = (l.transactions?.merchant ?? "").trim().toLowerCase();
+    if (!m) continue;
+    const set = merchants.get(l.subscription_id) ?? new Set<string>();
+    set.add(m);
+    merchants.set(l.subscription_id, set);
+  }
+
+  return ((subs ?? []) as any[]).map((s) => ({
+    id: s.id,
+    label: s.label,
+    cadence: s.cadence,
+    median_amount: s.median_amount === null ? null : Number(s.median_amount),
+    merchants: [...(merchants.get(s.id) ?? [])].sort(),
+  }));
+}
+
 /** Transactions needing enrichment, for the nightly agent.
  *
  *  A noted transaction with no enrichment row, or one whose note changed since
@@ -49,14 +90,16 @@ router.get("/pending", async (req: Request, res: Response) => {
   }
 
   try {
-    const [pending, cats] = await Promise.all([
+    const [pending, cats, subscriptions] = await Promise.all([
       selectPendingEnrichment(limit, relabelBefore),
       categorySlugs(user.id),
+      subscriptionChoices(user.id),
     ]);
     const mine = pending.filter((p) => p.user_id === user.id);
     res.json({
       success: true,
       known_category_slugs: (cats.data ?? []).map((c: { slug: string }) => c.slug).sort(),
+      subscriptions,
       relabel_before: relabelBefore ?? null,
       count: mine.length,
       transactions: mine.map((p) => ({
@@ -64,7 +107,13 @@ router.get("/pending", async (req: Request, res: Response) => {
         note: p.notes,
         merchant: p.merchant,
         amount: p.amount,
+        direction: p.direction,
         current_category: p.category,
+        reason: p.reason,
+        // Resolved here so the agent never has to reason about why a row came
+        // back. A backfill re-offer gets its missing fields filled in and its
+        // settled category left alone.
+        suggest_category: maySuggestCategory(p.reason),
       })),
     });
   } catch (err) {
@@ -91,15 +140,19 @@ router.post("/submit", async (req: Request, res: Response) => {
   try {
     // Same cutoff the agent fetched with, or its ids would not be in the
     // offered set and a whole backfill batch would come back rejected.
-    const [pending, cats] = await Promise.all([
+    const [pending, cats, subscriptions] = await Promise.all([
       selectPendingEnrichment(1000, parsed.data.relabel_before),
       categorySlugs(user.id),
+      subscriptionChoices(user.id),
     ]);
     const mine = pending.filter((p) => p.user_id === user.id);
     const offered = new Set(mine.map((p) => p.id));
     const slugs = new Set((cats.data ?? []).map((c: { slug: string }) => c.slug.toLowerCase()));
 
-    const { accepted, errors } = verifyEnrichment(parsed.data, offered, slugs);
+    const { accepted, errors } = verifyEnrichment(parsed.data, offered, slugs, {
+      suggestableIds: new Set(mine.filter((p) => maySuggestCategory(p.reason)).map((p) => p.id)),
+      knownSubscriptionIds: new Set(subscriptions.map((s) => s.id)),
+    });
     if (accepted.length === 0) {
       res.status(errors.length > 0 ? 422 : 200).json({ success: errors.length === 0, stored: 0, errors });
       return;
@@ -138,7 +191,29 @@ router.post("/submit", async (req: Request, res: Response) => {
       .upsert(rows, { onConflict: "transaction_id" });
     if (error) throw new Error(`enrichment upsert failed: ${error.message}`);
 
-    res.json({ success: true, stored: rows.length, skipped: errors.length, errors });
+    // Linking runs after the labels are safely stored. A failure here must not
+    // discard a batch of good enrichment, so it is reported, not thrown.
+    let links = { linked: 0, skipped: [] as { transactionId: string; reason: string }[], recomputed: [] as string[] };
+    try {
+      links = await linkToSubscriptions(
+        user.id,
+        accepted
+          .filter((a) => a.subscription_id)
+          .map((a) => ({ transactionId: a.id, subscriptionId: a.subscription_id! })),
+      );
+    } catch (linkErr) {
+      errors.push(`subscription linking failed: ${(linkErr as Error).message}`);
+    }
+
+    res.json({
+      success: true,
+      stored: rows.length,
+      skipped: errors.length,
+      errors,
+      linked: links.linked,
+      link_skipped: links.skipped,
+      subscriptions_recomputed: links.recomputed.length,
+    });
   } catch (err) {
     res.status(500).json({ success: false, error: (err as Error).message });
   }

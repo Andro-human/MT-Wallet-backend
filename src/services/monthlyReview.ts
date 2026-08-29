@@ -45,6 +45,16 @@ export interface PayloadItem {
   name: string;
   slug: string | null;
   total: number;
+  /** Digest of the rows behind this item. Covers every input the one-liner and
+   *  the group labels read — membership, net amount, note, merchant, combine
+   *  tag — so an edited note or a late refund reopens the item while an
+   *  untouched category stays closed. Keyed on transaction id, not ordinal, so
+   *  a transaction added elsewhere in the month does not invalidate it. */
+  fingerprint: string;
+  /** Resolved by code, exactly like a day's needs_summary: submit a grouping
+   *  for this item if and only if this is true. Everything else is carried
+   *  forward from what is already stored. */
+  needs_regen: boolean;
   txns: PayloadTxn[];
 }
 export interface PayloadDay {
@@ -99,6 +109,28 @@ async function fetchAll<T>(
   return rows;
 }
 
+// Separator and truncation length are load-bearing: changing either invalidates
+// every stored day fingerprint and rewrites months of settled summaries.
+const digest = (keys: string[]) =>
+  createHash("sha256").update([...keys].sort().join("\u0000")).digest("hex").slice(0, 16);
+
+/** Identity of a breakdown across regenerations: the group key for grouped
+ *  spend, the category slug otherwise. Matches what storeReview writes as
+ *  `category`, which is how a stored breakdown finds its payload item again. */
+export function breakdownKey(item: Pick<PayloadItem, "kind" | "key" | "slug">): string {
+  return item.kind === "group" ? item.key : (item.slug ?? "uncategorized");
+}
+
+export interface StoredBreakdown {
+  category: string | null;
+  name: string;
+  total: number;
+  one_liner: string | null;
+  groups: { label: string; amount: number; count: number }[];
+  reconciled?: boolean;
+  fingerprint?: string | null;
+}
+
 export interface StoredDay {
   notes_fingerprint: string | null;
   model: string | null;
@@ -148,14 +180,37 @@ export function daySummaryStatus(
   };
 }
 
+export async function loadStoredBreakdowns(userId: string, month: string): Promise<StoredBreakdown[]> {
+  const { data, error } = await supabase
+    .from("monthly_summaries")
+    .select("category_breakdowns")
+    .eq("user_id", userId)
+    .eq("month", month)
+    .maybeSingle();
+  if (error) throw new Error(`monthly_summaries: ${error.message}`);
+  return (data?.category_breakdowns as StoredBreakdown[]) ?? [];
+}
+
 export async function buildReviewPayload(userId: string, month: string): Promise<ReviewPayload> {
   const [y, m] = month.split("-").map(Number);
   // Padded UTC window so IST month-edge transactions are never missed.
   const windowStart = new Date(Date.UTC(y, m - 1, 1) - 36 * 3600 * 1000).toISOString();
   const windowEnd = new Date(Date.UTC(y, m, 1) + 36 * 3600 * 1000).toISOString();
+  // Half-open, because `${month}-31` is not a date in a 30-day month and
+  // Postgres rejects the whole query rather than clamping it.
+  const nextMonthFirst = new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 10);
 
-  const [txnsRaw, refundLinks, duplicateLinks, combinedRows, categories, groups, existingDays, priorSummaries] =
-    await Promise.all([
+  const [
+    txnsRaw,
+    refundLinks,
+    duplicateLinks,
+    combinedRows,
+    categories,
+    groups,
+    existingDays,
+    priorSummaries,
+    storedBreakdowns,
+  ] = await Promise.all([
       fetchAll<any>(
         "transactions",
         "id, amount, merchant, notes, transacted_at, direction, is_expense, is_income, category_id, group_id",
@@ -173,7 +228,7 @@ export async function buildReviewPayload(userId: string, month: string): Promise
       ),
       fetchAll<any>("transaction_groups", "id, name", (q) => q.eq("user_id", userId)),
       fetchAll<any>("day_summaries", "day, notes_fingerprint, model", (q) =>
-        q.eq("user_id", userId).gte("day", `${month}-01`).lte("day", `${month}-31`),
+        q.eq("user_id", userId).gte("day", `${month}-01`).lt("day", nextMonthFirst),
       ),
       supabase
         .from("monthly_summaries")
@@ -186,6 +241,7 @@ export async function buildReviewPayload(userId: string, month: string): Promise
           if (error) throw new Error(`monthly_summaries: ${error.message}`);
           return data ?? [];
         }),
+      loadStoredBreakdowns(userId, month),
     ]);
 
   // Short, stable per-payload tags so the agent can see which rows are one
@@ -221,7 +277,8 @@ export async function buildReviewPayload(userId: string, month: string): Promise
   const catById = new Map(categories.map((c: any) => [c.id, c]));
   const groupById = new Map(groups.map((g: any) => [g.id, g]));
 
-  const itemsByKey = new Map<string, PayloadItem>();
+  const itemsByKey = new Map<string, Omit<PayloadItem, "fingerprint" | "needs_regen">>();
+  const itemKeys = new Map<string, string[]>();
   const dayAcc = new Map<string, { total: number; txns: PayloadTxn[]; noteKeys: string[]; allNoted: boolean }>();
   const incomeLines: ReviewPayload["income_lines"] = [];
   const excluded = { duplicates: 0, fullyRefunded: 0, notCounted: 0 };
@@ -285,9 +342,13 @@ export async function buildReviewPayload(userId: string, month: string): Promise
     item.total = round2(item.total + net);
     itemsByKey.set(key, item);
 
+    const note = (t.notes ?? "").trim();
+    const keys = itemKeys.get(key) ?? [];
+    keys.push(`${t.id}:${net}:${t.merchant ?? ""}:${combineTag.get(t.id) ?? ""}:${note}`);
+    itemKeys.set(key, keys);
+
     const dayKey = istDay(t.transacted_at);
     const day = dayAcc.get(dayKey) ?? { total: 0, txns: [], noteKeys: [], allNoted: true };
-    const note = (t.notes ?? "").trim();
     day.total = round2(day.total + net);
     day.txns.push({
       n,
@@ -315,18 +376,28 @@ export async function buildReviewPayload(userId: string, month: string): Promise
     for (const b of s.category_breakdowns ?? []) for (const g of b.groups ?? []) groupLabels.add(g.label);
   }
 
+  const storedFingerprints = new Map(
+    storedBreakdowns.map((b) => [b.category ?? "", b.fingerprint ?? null]),
+  );
+
   return {
     month,
     timezone: TZ,
     totals: { spent: totalSpent, income: totalIncome },
-    items: [...itemsByKey.values()].sort((a, b) => b.total - a.total),
+    items: [...itemsByKey.values()]
+      .sort((a, b) => b.total - a.total)
+      .map((item) => {
+        const fingerprint = digest(itemKeys.get(item.key) ?? []);
+        return {
+          ...item,
+          fingerprint,
+          needs_regen: storedFingerprints.get(breakdownKey(item)) !== fingerprint,
+        };
+      }),
     days: [...dayAcc.entries()]
       .sort((a, b) => (a[0] < b[0] ? 1 : -1))
       .map(([day, d]) => {
-        const fingerprint = createHash("sha256")
-          .update(d.noteKeys.sort().join("\u0000"))
-          .digest("hex")
-          .slice(0, 16);
+        const fingerprint = digest(d.noteKeys);
         return {
           day,
           total: d.total,
@@ -352,7 +423,6 @@ const GroupingSchema = z.object({
 export const ReviewSubmissionSchema = z.object({
   month: z.string().regex(MONTH_RE),
   review: z.object({
-    summary: z.string().min(1).max(4000),
     highlights: z.array(z.string().min(1).max(500)).min(2).max(8),
     model: z.string().max(80).default("gemini-spark"),
   }),
@@ -502,19 +572,29 @@ export interface ReconciledSubmission {
     one_liner: string | null;
     groups: ReconciledGroup[];
     reconciled: boolean;
+    fingerprint: string;
   }[];
+  /** How many breakdowns came from storage rather than this submission. */
+  carried: number;
   slices: ReconciledGroup[];
   days: ReconciledDay[];
 }
 
 /**
- * Pure reconciliation: every payload item must be partitioned exactly once,
+ * Pure reconciliation: every payload item must be accounted for — either
+ * partitioned by this submission or carried forward unchanged from `stored` —
  * every submitted key must exist, and sums must match to the paisa. Any
  * violation lands in `errors` — the caller must not store when errors exist.
+ *
+ * An item may only be carried forward when the payload marked it needs_regen
+ * false, which means its fingerprint still matches what produced the stored
+ * groups. Anything the agent left out and code considers changed is an error,
+ * not a silent carry-over.
  */
 export function reconcileSubmission(
   payload: ReviewPayload,
   submission: ReviewSubmission,
+  stored: StoredBreakdown[] = [],
 ): ReconciledSubmission {
   const errors: string[] = [];
 
@@ -529,11 +609,36 @@ export function reconcileSubmission(
     if (!payload.items.some((p) => p.key === i.key)) pushError(errors, `unknown item key ${i.key}`);
   }
 
+  const storedByKey = new Map(stored.map((b) => [b.category ?? "", b]));
   const breakdowns: ReconciledSubmission["breakdowns"] = [];
+  let carried = 0;
   for (const item of payload.items) {
     const sub = submittedByKey.get(item.key);
     if (!sub) {
-      pushError(errors, `${item.name} (${item.key}): no grouping submitted`);
+      const prior = storedByKey.get(breakdownKey(item));
+      if (item.needs_regen || !prior) {
+        pushError(errors, `${item.name} (${item.key}): no grouping submitted`);
+        continue;
+      }
+      if (Math.abs(prior.total - item.total) >= 0.01) {
+        pushError(
+          errors,
+          `${item.name} (${item.key}): stored breakdown totals ₹${prior.total} but the month now holds ₹${item.total}`,
+        );
+        continue;
+      }
+      carried++;
+      breakdowns.push({
+        category: item.kind === "group" ? item.key : item.slug,
+        // A renamed category should show its new name without forcing the agent
+        // to rewrite groups that did not change.
+        name: item.name,
+        total: round2(item.total),
+        one_liner: prior.one_liner,
+        groups: prior.groups,
+        reconciled: true,
+        fingerprint: item.fingerprint,
+      });
       continue;
     }
     const byN = new Map(item.txns.map((t) => [t.n, t.amount]));
@@ -545,6 +650,7 @@ export function reconcileSubmission(
       one_liner: sub.one_liner,
       groups,
       reconciled: true,
+      fingerprint: item.fingerprint,
     });
   }
 
@@ -556,7 +662,7 @@ export function reconcileSubmission(
 
   const days = reconcileDays(payload, submission, errors);
 
-  return { errors, breakdowns, slices, days };
+  return { errors, breakdowns, carried, slices, days };
 }
 
 /**
@@ -567,22 +673,28 @@ export async function storeReview(
   userId: string,
   payload: ReviewPayload,
   submission: ReviewSubmission,
-): Promise<{ errors: string[] } | { stored: true; items: number; slices: number; days: number }> {
-  const { errors, breakdowns, slices, days } = reconcileSubmission(payload, submission);
+): Promise<
+  | { errors: string[] }
+  | { stored: true; items: number; carried: number; slices: number; days: number }
+> {
+  const { data: priorRow } = await supabase
+    .from("monthly_summaries")
+    .select("spend_slices, category_breakdowns")
+    .eq("user_id", userId)
+    .eq("month", payload.month)
+    .maybeSingle();
+
+  const { errors, breakdowns, carried, slices, days } = reconcileSubmission(
+    payload,
+    submission,
+    (priorRow?.category_breakdowns as StoredBreakdown[]) ?? [],
+  );
   if (errors.length > 0) return { errors };
 
   // A submission without slices means "no slice update", not "clear them" —
   // keep whatever the month already has stored.
-  let storedSlices: ReconciledGroup[] = slices;
-  if (submission.slices.length === 0) {
-    const { data } = await supabase
-      .from("monthly_summaries")
-      .select("spend_slices")
-      .eq("user_id", userId)
-      .eq("month", payload.month)
-      .maybeSingle();
-    storedSlices = (data?.spend_slices as ReconciledGroup[]) ?? [];
-  }
+  const storedSlices: ReconciledGroup[] =
+    submission.slices.length > 0 ? slices : ((priorRow?.spend_slices as ReconciledGroup[]) ?? []);
 
   const aggregates = {
     month: payload.month,
@@ -602,7 +714,6 @@ export async function storeReview(
   const { error } = await supabase.from("monthly_summaries").upsert({
     user_id: userId,
     month: payload.month,
-    summary: submission.review.summary,
     highlights: submission.review.highlights,
     aggregates,
     category_breakdowns: breakdowns,
@@ -648,7 +759,14 @@ export async function storeReview(
 
   console.log(
     `[review] stored ${payload.month} for ${userId} via ${submission.review.model}: ` +
-      `${breakdowns.length} items, ${storedSlices.length} slices${submission.slices.length === 0 ? " (carried over)" : ""}, ${days.length} days`,
+      `${breakdowns.length} items (${carried} carried), ` +
+      `${storedSlices.length} slices${submission.slices.length === 0 ? " (carried over)" : ""}, ${days.length} days`,
   );
-  return { stored: true, items: breakdowns.length, slices: storedSlices.length, days: days.length };
+  return {
+    stored: true,
+    items: breakdowns.length,
+    carried,
+    slices: storedSlices.length,
+    days: days.length,
+  };
 }
