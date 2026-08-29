@@ -101,7 +101,7 @@ async function loadAllRows(table: string, cols: string, userId: string): Promise
   return out;
 }
 
-async function recomputeSubscription(subscriptionId: string) {
+export async function recomputeSubscription(subscriptionId: string) {
   const { data, error } = await supabase
     .from("subscription_transactions")
     .select("amount, transacted_at")

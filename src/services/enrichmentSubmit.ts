@@ -22,6 +22,11 @@ export const EnrichmentItemSchema = z.object({
     .optional(),
   category_suggestion: z.string().trim().min(1).max(64).nullable().optional(),
   service_identity: z.string().trim().min(1).max(80).nullable().optional(),
+  /** The subscription this charge belongs to, chosen from the list the payload
+   *  carried. Replaces the round trip where the agent wrote a service name as
+   *  free text and the server tried to string-match it back to a subscription:
+   *  "policy bazzar" only ever reached Life Insurance by luck. */
+  subscription_id: z.string().uuid().nullable().optional(),
 });
 
 export const EnrichmentSubmissionSchema = z.object({
@@ -57,6 +62,12 @@ export function verifyEnrichment(
   submission: EnrichmentSubmission,
   offeredIds: Set<string>,
   knownCategorySlugs: Set<string>,
+  opts: {
+    /** Ids the payload marked as eligible for a category suggestion. A row
+     *  re-offered only to backfill a field is not one of them. */
+    suggestableIds?: Set<string>;
+    knownSubscriptionIds?: Set<string>;
+  } = {},
 ): EnrichmentVerdict {
   const accepted: EnrichmentItem[] = [];
   const errors: string[] = [];
@@ -89,11 +100,29 @@ export function verifyEnrichment(
       continue;
     }
 
+    // Dropped rather than rejected: the row's other fields are still wanted,
+    // and a backfill run has no business reopening a settled category.
+    let suggestion = item.category_suggestion ?? null;
+    if (suggestion != null && opts.suggestableIds && !opts.suggestableIds.has(item.id)) {
+      note(`${item.id}: category suggestion ignored, this row was offered only for backfill`);
+      suggestion = null;
+    }
+
+    if (
+      item.subscription_id != null &&
+      opts.knownSubscriptionIds &&
+      !opts.knownSubscriptionIds.has(item.subscription_id)
+    ) {
+      note(`${item.id}: unknown subscription "${item.subscription_id}"`);
+      continue;
+    }
+
     accepted.push({
       id: item.id,
       lending: item.lending ?? null,
-      category_suggestion: item.category_suggestion ?? null,
+      category_suggestion: suggestion,
       service_identity: item.service_identity ?? null,
+      subscription_id: item.subscription_id ?? null,
     });
   }
 

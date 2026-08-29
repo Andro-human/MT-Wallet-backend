@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isPending, noteHash } from "./enrichmentPending.js";
+import { isPending, noteHash, pendingReason, maySuggestCategory } from "./enrichmentPending.js";
 
 const NOTE = "zomato, biryani for two";
 const fresh = (over?: Partial<{ note_hash: string; model: string; enriched_at: string }>) => ({
@@ -58,4 +58,35 @@ test("a cutoff compares as an instant, not as a string", () => {
   // after it lexicographically.
   const old = fresh({ enriched_at: "2026-07-13T10:00:00+05:30" });
   assert.equal(isPending(NOTE, old, "2026-07-13T06:00:00.000Z"), true);
+});
+
+// ─── why a row came back ────────────────────────────────────────────────────
+
+test("a row never enriched is new, and may be given a category", () => {
+  assert.equal(pendingReason("dinner", null), "new");
+  assert.equal(maySuggestCategory("new"), true);
+});
+
+test("an edited note reopens the row for a category too", () => {
+  const stored = { note_hash: noteHash("old"), model: "gemini", enriched_at: "2026-01-01T00:00:00Z" };
+  assert.equal(pendingReason("new text", stored), "note_changed");
+  assert.equal(maySuggestCategory("note_changed"), true);
+});
+
+test("a row re-offered only by the cutoff is backfill, and its category is settled", () => {
+  // This is why suggestions reached back to April: nothing about these rows
+  // changed, they were re-offered to fill in a field added later.
+  const stored = { note_hash: noteHash("dinner"), model: "gemini", enriched_at: "2026-01-01T00:00:00Z" };
+  assert.equal(pendingReason("dinner", stored, "2026-08-01T00:00:00Z"), "backfill");
+  assert.equal(maySuggestCategory("backfill"), false);
+});
+
+test("an unchanged row with no cutoff is not offered at all", () => {
+  const stored = { note_hash: noteHash("dinner"), model: "gemini", enriched_at: "2026-01-01T00:00:00Z" };
+  assert.equal(pendingReason("dinner", stored), null);
+});
+
+test("a changed note beats the cutoff: it is note_changed, not backfill", () => {
+  const stored = { note_hash: noteHash("old"), model: "gemini", enriched_at: "2026-01-01T00:00:00Z" };
+  assert.equal(pendingReason("new text", stored, "2026-08-01T00:00:00Z"), "note_changed");
 });
