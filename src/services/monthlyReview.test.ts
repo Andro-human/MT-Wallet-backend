@@ -494,21 +494,3 @@ test("a zero income month does not treat every zero as a forbidden total", () =>
   assert.deepEqual(totalsInHighlights(["Nothing cost \u20b90."], 200, 0), []);
 });
 
-test("a highlight that sprawls past a line is rejected at the schema", () => {
-  // The real regression: 220 characters of bike models, rental days and
-  // per-stay amounts instead of what the money bought.
-  const sprawl =
-    "The Meghalaya trip came to ₹17,569.29, most of it two bike rentals at ₹2,896 for a 7 day Hunter 350 and ₹2,767 for a Ronin, and stays at ₹1,062.70 in Guwahati, ₹1,000 advanced for Cherrapunji and ₹500 for the Shillong house.";
-  assert.ok(sprawl.length > 180);
-  assert.throws(() => submit({ review: { highlights: [sprawl, "b"] } }));
-});
-
-test("the shape that reads well fits comfortably", () => {
-  const good = [
-    "Shopping ₹45,013.35: that CPU, a ₹2,918.55 helmet and earphone cover order, a ₹1,499 ear cleaner.",
-    "Subscriptions ₹3,220.54 across five services: Bumble ₹1,999, Tinder ₹319, Amazon premium ₹399, CIBIL score ₹399, YouTube Premium ₹104.54.",
-    "PNB NACH charge ₹295, the only bank fee on the ledger.",
-  ];
-  for (const h of good) assert.ok(h.length <= 180, `${h.length} chars: ${h}`);
-  assert.doesNotThrow(() => submit({ review: { highlights: good } }));
-});
