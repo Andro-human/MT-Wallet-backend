@@ -428,7 +428,11 @@ export const ReviewSubmissionSchema = z.object({
    *  not a guarantee. */
   catch_up: z.boolean().default(false),
   review: z.object({
-    highlights: z.array(z.string().min(1).max(500)).min(2).max(8),
+    // 180, because the shape that reads well tops out around 140: "Subscriptions
+    // \u20b93,220.54 across five services: Bumble \u20b91,999, Tinder \u20b9319, ..." is 137.
+    // A highlight that needs more room has started narrating the purchase (dates,
+    // rental durations, product models) instead of naming where the money went.
+    highlights: z.array(z.string().min(1).max(180)).min(2).max(8),
     model: z.string().max(80).default("gemini-spark"),
   }),
   items: z
