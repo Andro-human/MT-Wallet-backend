@@ -1,4 +1,9 @@
-import { buildReviewPayload, currentIstMonth, type ReviewPayload } from "./monthlyReview.js";
+import {
+  buildReviewPayload,
+  currentIstMonth,
+  totalsInHighlights,
+  type ReviewPayload,
+} from "./monthlyReview.js";
 import { supabase } from "./supabase.js";
 
 /**
@@ -17,6 +22,10 @@ export interface MonthStatus {
   items_stale: number;
   items_total: number;
   days_stale: number;
+  /** The stored highlights break a rule the server now enforces. Highlights are
+   *  rewritten in full on any submission, so a month in this state needs only
+   *  the highlights resubmitted, not its categories regrouped. */
+  highlights_stale: boolean;
   needs_work: boolean;
 }
 
@@ -30,17 +39,26 @@ export function monthsBefore(month: string, count: number): string[] {
   return out;
 }
 
-export function statusOf(month: string, payload: ReviewPayload, hasReview: boolean): MonthStatus {
+export function statusOf(
+  month: string,
+  payload: ReviewPayload,
+  hasReview: boolean,
+  storedHighlights: string[] = [],
+): MonthStatus {
   const items_stale = payload.items.filter((i) => i.needs_regen).length;
   const days_stale = payload.days.filter((d) => d.needs_summary).length;
+  const highlights_stale =
+    hasReview &&
+    totalsInHighlights(storedHighlights, payload.totals.spent, payload.totals.income).length > 0;
   return {
     month,
     has_review: hasReview,
     items_stale,
     items_total: payload.items.length,
     days_stale,
+    highlights_stale,
     // A month with no counted spend has nothing to write, review row or not.
-    needs_work: items_stale > 0 || days_stale > 0,
+    needs_work: items_stale > 0 || days_stale > 0 || highlights_stale,
   };
 }
 
@@ -73,14 +91,24 @@ export async function findStaleMonths(
 
   const { data: reviewed, error } = await supabase
     .from("monthly_summaries")
-    .select("month")
+    .select("month, highlights")
     .eq("user_id", userId)
     .in("month", window);
   if (error) throw new Error(`monthly_summaries: ${error.message}`);
-  const hasReview = new Set((reviewed ?? []).map((r: { month: string }) => r.month));
+  const stored = new Map(
+    (reviewed ?? []).map((r: { month: string; highlights: unknown }) => [
+      r.month,
+      Array.isArray(r.highlights) ? (r.highlights as string[]) : [],
+    ]),
+  );
 
   const statuses = await mapPool(window, 4, async (month) =>
-    statusOf(month, await buildReviewPayload(userId, month), hasReview.has(month)),
+    statusOf(
+      month,
+      await buildReviewPayload(userId, month),
+      stored.has(month),
+      stored.get(month) ?? [],
+    ),
   );
 
   const stale = statuses.filter((s) => s.needs_work);

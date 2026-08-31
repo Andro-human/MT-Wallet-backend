@@ -7,6 +7,7 @@ import {
   daySummaryStatus,
   ReviewSubmissionSchema,
   isEffectivelyNoted,
+  totalsInHighlights,
   type ReviewPayload,
   type StoredBreakdown,
 } from "./monthlyReview.js";
@@ -99,6 +100,14 @@ test("error list is capped", () => {
   assert.ok(errors.some((e) => e.includes("truncated")));
 });
 
+/** The guard on ended months is tested on its own below; everywhere else the
+ *  payload's month IS the current month, so it stays out of the way. */
+const reconcile = (
+  payload: ReviewPayload,
+  submission: any,
+  stored?: StoredBreakdown[],
+) => reconcileSubmission(payload, submission, stored, payload.month);
+
 function makePayload(over: { needsRegen?: boolean } = {}): ReviewPayload {
   const needs_regen = over.needsRegen ?? true;
   return {
@@ -146,7 +155,7 @@ const submit = (over: Record<string, unknown>) =>
   });
 
 test("full submission reconciles: breakdowns keyed by slug/group-key, slices optional", () => {
-  const r = reconcileSubmission(makePayload(), submit({}));
+  const r = reconcile(makePayload(), submit({}));
   assert.deepEqual(r.errors, []);
   assert.deepEqual(
     r.breakdowns.map((b) => b.category),
@@ -156,7 +165,7 @@ test("full submission reconciles: breakdowns keyed by slug/group-key, slices opt
 });
 
 test("rejects unknown and missing item keys", () => {
-  const r = reconcileSubmission(
+  const r = reconcile(
     makePayload(),
     submit({ items: [{ key: "cat:bogus", groups: [{ label: "x", ordinals: [1] }] }] }),
   );
@@ -166,7 +175,7 @@ test("rejects unknown and missing item keys", () => {
 });
 
 test("rejects duplicate submission keys instead of silently dropping one", () => {
-  const r = reconcileSubmission(
+  const r = reconcile(
     makePayload(),
     submit({
       items: [
@@ -180,17 +189,17 @@ test("rejects duplicate submission keys instead of silently dropping one", () =>
 });
 
 test("slices reconcile across ALL items and must sum to total spent", () => {
-  const good = reconcileSubmission(makePayload(), submit({ slices: [{ label: "all", ordinals: [1, 2] }] }));
+  const good = reconcile(makePayload(), submit({ slices: [{ label: "all", ordinals: [1, 2] }] }));
   assert.deepEqual(good.errors, []);
   assert.equal(good.slices[0].amount, 200);
 
-  const partial = reconcileSubmission(makePayload(), submit({ slices: [{ label: "half", ordinals: [1] }] }));
+  const partial = reconcile(makePayload(), submit({ slices: [{ label: "half", ordinals: [1] }] }));
   assert.ok(partial.errors.some((e) => e.includes("slices: ordinals not covered: 2")));
 });
 
 test("zero-expense month: empty items reconcile cleanly", () => {
   const empty: ReviewPayload = { ...makePayload(), totals: { spent: 0, income: 500 }, items: [] };
-  const r = reconcileSubmission(empty, submit({ items: [] }));
+  const r = reconcile(empty, submit({ items: [] }));
   assert.deepEqual(r.errors, []);
   assert.deepEqual(r.breakdowns, []);
 });
@@ -210,7 +219,7 @@ const storedA = (over: Partial<StoredBreakdown> = {}): StoredBreakdown => ({
 const onlyB = { items: [{ key: "group:b", groups: [{ label: "y", ordinals: [2] }] }] };
 
 test("an unchanged item is carried forward when the agent leaves it out", () => {
-  const r = reconcileSubmission(makePayload({ needsRegen: false }), submit(onlyB), [storedA()]);
+  const r = reconcile(makePayload({ needsRegen: false }), submit(onlyB), [storedA()]);
   assert.deepEqual(r.errors, []);
   assert.equal(r.carried, 1);
   const a = r.breakdowns.find((b) => b.category === "a")!;
@@ -220,20 +229,20 @@ test("an unchanged item is carried forward when the agent leaves it out", () => 
 
 test("a changed item left out is an error, never a silent carry-over", () => {
   // A stored breakdown exists, but its fingerprint no longer matches the month.
-  const r = reconcileSubmission(makePayload({ needsRegen: true }), submit(onlyB), [storedA()]);
+  const r = reconcile(makePayload({ needsRegen: true }), submit(onlyB), [storedA()]);
   assert.ok(r.errors.some((e) => e.includes("A (cat:a): no grouping submitted")), r.errors.join(" | "));
   assert.equal(r.carried, 0);
 });
 
 test("an unchanged item with nothing stored is still an error", () => {
-  const r = reconcileSubmission(makePayload({ needsRegen: false }), submit(onlyB), []);
+  const r = reconcile(makePayload({ needsRegen: false }), submit(onlyB), []);
   assert.ok(r.errors.some((e) => e.includes("A (cat:a): no grouping submitted")), r.errors.join(" | "));
 });
 
 test("a stored breakdown whose total no longer matches is refused", () => {
   // Belt and braces: needs_regen says unchanged but the figures disagree, which
   // would publish a total that no longer sums from the month's transactions.
-  const r = reconcileSubmission(makePayload({ needsRegen: false }), submit(onlyB), [
+  const r = reconcile(makePayload({ needsRegen: false }), submit(onlyB), [
     storedA({ total: 90 }),
   ]);
   assert.ok(r.errors.some((e) => e.includes("stored breakdown totals")), r.errors.join(" | "));
@@ -243,13 +252,13 @@ test("a stored breakdown whose total no longer matches is refused", () => {
 test("a carried breakdown takes the category's current name", () => {
   const payload = makePayload({ needsRegen: false });
   payload.items[0].name = "Food & Dining";
-  const r = reconcileSubmission(payload, submit(onlyB), [storedA()]);
+  const r = reconcile(payload, submit(onlyB), [storedA()]);
   assert.deepEqual(r.errors, []);
   assert.equal(r.breakdowns.find((b) => b.category === "a")!.name, "Food & Dining");
 });
 
 test("every breakdown is stamped with the fingerprint it was built from", () => {
-  const r = reconcileSubmission(makePayload({ needsRegen: false }), submit(onlyB), [storedA()]);
+  const r = reconcile(makePayload({ needsRegen: false }), submit(onlyB), [storedA()]);
   assert.deepEqual(
     r.breakdowns.map((b) => b.fingerprint).sort(),
     ["fp-a", "fp-b"],
@@ -265,7 +274,7 @@ test("a group item is carried by its group key, not a slug", () => {
     groups: [{ label: "y", amount: 100, count: 1 }],
     fingerprint: "fp-b",
   };
-  const r = reconcileSubmission(
+  const r = reconcile(
     makePayload({ needsRegen: false }),
     submit({ items: [{ key: "cat:a", groups: [{ label: "x", ordinals: [1] }] }] }),
     [stored],
@@ -275,7 +284,7 @@ test("a group item is carried by its group key, not a slug", () => {
 });
 
 test("submitting an item that did not need regenerating is still accepted", () => {
-  const r = reconcileSubmission(makePayload({ needsRegen: false }), submit({}), [storedA()]);
+  const r = reconcile(makePayload({ needsRegen: false }), submit({}), [storedA()]);
   assert.deepEqual(r.errors, []);
   assert.equal(r.carried, 0);
   assert.equal(r.breakdowns.find((b) => b.category === "a")!.one_liner, null);
@@ -429,4 +438,58 @@ test("an uncombined row with no note still blocks the day", () => {
 
 test("a combined purchase where nothing carries a note still blocks the day", () => {
   assert.equal(isEffectivelyNoted("", "c2", new Set(["c1"])), false);
+});
+
+// ─── the ended-month guard ──────────────────────────────────────────────────
+
+test("an ended month is refused unless the caller declares the catch-up run", () => {
+  const r = reconcileSubmission(makePayload(), submit({}), [], "2026-08");
+  assert.ok(r.errors.some((e) => e.includes("only the catch-up run")), r.errors.join(" | "));
+});
+
+test("the catch-up run may write an ended month", () => {
+  const r = reconcileSubmission(makePayload(), submit({ catch_up: true }), [], "2026-08");
+  assert.deepEqual(r.errors, []);
+});
+
+test("the current month needs no such declaration", () => {
+  const r = reconcileSubmission(makePayload(), submit({}), [], "2026-07");
+  assert.deepEqual(r.errors, []);
+});
+
+// ─── month totals in highlights ─────────────────────────────────────────────
+
+test("a highlight restating the month's spend is refused", () => {
+  const r = reconcileSubmission(
+    makePayload(),
+    submit({ review: { highlights: ["\u20b9200 spent this month.", "Something real."] } }),
+    [],
+    "2026-07",
+  );
+  assert.ok(r.errors.some((e) => e.includes("restates a month total")), r.errors.join(" | "));
+});
+
+test("a highlight restating income is refused too", () => {
+  const payload = { ...makePayload(), totals: { spent: 200, income: 500 } };
+  const r = reconcileSubmission(
+    payload,
+    submit({ review: { highlights: ["Income was \u20b9500.", "Something real."] } }),
+    [],
+    "2026-07",
+  );
+  assert.ok(r.errors.some((e) => e.includes("restates a month total")), r.errors.join(" | "));
+});
+
+test("a group total that happens to be quoted is fine", () => {
+  const r = reconcileSubmission(
+    makePayload(),
+    submit({ review: { highlights: ["A cost \u20b9100.", "B cost \u20b9100."] } }),
+    [],
+    "2026-07",
+  );
+  assert.deepEqual(r.errors, []);
+});
+
+test("a zero income month does not treat every zero as a forbidden total", () => {
+  assert.deepEqual(totalsInHighlights(["Nothing cost \u20b90."], 200, 0), []);
 });
