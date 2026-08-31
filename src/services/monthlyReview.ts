@@ -422,6 +422,11 @@ const GroupingSchema = z.object({
 });
 export const ReviewSubmissionSchema = z.object({
   month: z.string().regex(MONTH_RE),
+  /** Declares this as the catch-up run, the only caller allowed to write a month
+   *  that has already ended. Nothing else stops run 1 from regenerating July if
+   *  it decides July looks wrong, and a guarantee that lives only in a prompt is
+   *  not a guarantee. */
+  catch_up: z.boolean().default(false),
   review: z.object({
     highlights: z.array(z.string().min(1).max(500)).min(2).max(8),
     model: z.string().max(80).default("gemini-spark"),
@@ -528,6 +533,30 @@ export function verifyFigures(
   }
 }
 
+/** The month's own totals are not an insight. They are printed at the top of the
+ *  page, in the stat strip, and on the dashboard; restating them spends the
+ *  first and most-read line of the review on a number the reader already has.
+ *  Enforced here rather than asked for in the prompt, because the agent
+ *  reproduced it every month for five months running.
+ */
+export function totalsInHighlights(
+  highlights: string[],
+  spent: number,
+  income: number,
+): { highlight: string; figure: number }[] {
+  const forbidden = [spent, income].filter((n) => n > 0);
+  const hits: { highlight: string; figure: number }[] = [];
+  for (const h of highlights) {
+    for (const m of h.matchAll(MONEY_RE)) {
+      const claimed = Number(m[1].replace(/,/g, ""));
+      if (!Number.isFinite(claimed)) continue;
+      const hit = forbidden.find((f) => Math.abs(f - claimed) < 0.01);
+      if (hit !== undefined) hits.push({ highlight: h, figure: hit });
+    }
+  }
+  return hits;
+}
+
 export function reconcileDays(
   payload: ReviewPayload,
   submission: ReviewSubmission,
@@ -595,8 +624,16 @@ export function reconcileSubmission(
   payload: ReviewPayload,
   submission: ReviewSubmission,
   stored: StoredBreakdown[] = [],
+  currentMonth: string = currentIstMonth(),
 ): ReconciledSubmission {
   const errors: string[] = [];
+
+  if (payload.month !== currentMonth && !submission.catch_up) {
+    pushError(
+      errors,
+      `${payload.month} has ended: only the catch-up run may rewrite it, and it must say so with catch_up`,
+    );
+  }
 
   const submittedByKey = new Map(submission.items.map((i) => [i.key, i]));
   if (submittedByKey.size !== submission.items.length) {
@@ -658,6 +695,17 @@ export function reconcileSubmission(
   if (submission.slices.length > 0) {
     const allByN = new Map(payload.items.flatMap((it) => it.txns.map((t) => [t.n, t.amount] as const)));
     slices = reconcilePartition("slices", allByN, submission.slices, payload.totals.spent, errors);
+  }
+
+  for (const hit of totalsInHighlights(
+    submission.review.highlights,
+    payload.totals.spent,
+    payload.totals.income,
+  )) {
+    pushError(
+      errors,
+      `highlight restates a month total (\u20b9${hit.figure}), which the page already shows: "${hit.highlight}"`,
+    );
   }
 
   const days = reconcileDays(payload, submission, errors);
