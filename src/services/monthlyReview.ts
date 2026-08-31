@@ -236,7 +236,10 @@ export async function buildReviewPayload(userId: string, month: string): Promise
         .eq("user_id", userId)
         .neq("month", month)
         .order("month", { ascending: false })
-        .limit(6)
+        // The whole vocabulary, not a recent window. Seventy labels is under a
+        // kilobyte of prompt; a six-month window hid `Travel bookings` from the
+        // month that then coined `Trip bookings` for the same thing.
+        .limit(24)
         .then(({ data, error }) => {
           if (error) throw new Error(`monthly_summaries: ${error.message}`);
           return data ?? [];
