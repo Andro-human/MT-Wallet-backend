@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { getUserByApiKey } from "../services/supabase.js";
 import {
   buildReviewPayload,
+  buildReviewPayloadWithIds,
   storeReview,
   currentIstMonth,
   ReviewSubmissionSchema,
@@ -84,8 +85,8 @@ router.post("/groupings", async (req: Request, res: Response) => {
   try {
     // Reconcile against a FRESH payload so drift between GET and POST
     // (new txns, refund links) fails loudly instead of storing stale sums.
-    const payload = await buildReviewPayload(user.id, parsed.data.month);
-    const result = await storeReview(user.id, payload, parsed.data);
+    const { payload, idByOrdinal } = await buildReviewPayloadWithIds(user.id, parsed.data.month);
+    const result = await storeReview(user.id, payload, parsed.data, idByOrdinal);
     if ("errors" in result) {
       res.status(422).json({
         success: false,

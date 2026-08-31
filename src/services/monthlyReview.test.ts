@@ -550,3 +550,87 @@ test("category one-liners are checked the same way and may cite a group total", 
   assert.equal(r.breakdowns.find((b) => b.category === "group:b")!.one_liner, null);
   assert.ok(r.warnings.some((w) => w.includes("B one-liner")), r.warnings.join(" | "));
 });
+
+
+// ─── Slice parts, and the transactions behind every figure ──────────────────
+
+const IDS = new Map([[1, "tx-one"], [2, "tx-two"]]);
+const reconcileIds = (payload: ReviewPayload, submission: any) =>
+  reconcileSubmission(payload, submission, [], payload.month, IDS);
+
+test("a part's amount is summed by the server, so the line may quote it", () => {
+  const r = reconcileIds(
+    makePayload(),
+    submit({
+      slices: [
+        {
+          label: "Trip",
+          ordinals: [1, 2],
+          parts: [{ label: "Stays", ordinals: [1, 2] }],
+          one_liner: "Stays \u20b9200.",
+        },
+      ],
+    }),
+  );
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.slices[0].parts![0].amount, 200);
+  assert.equal(r.slices[0].one_liner, "Stays \u20b9200.");
+});
+
+test("what the parts leave out becomes a remainder the server computes", () => {
+  const r = reconcileIds(
+    makePayload(),
+    submit({
+      slices: [
+        {
+          label: "Trip",
+          ordinals: [1, 2],
+          parts: [{ label: "Stays", ordinals: [1] }],
+          one_liner: "Stays \u20b9100 and \u20b9100 across the rest.",
+        },
+      ],
+    }),
+  );
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(
+    r.slices[0].parts!.map((p) => [p.label, p.amount]),
+    [["Stays", 100], ["Everything else", 100]],
+  );
+  assert.equal(r.slices[0].one_liner, "Stays \u20b9100 and \u20b9100 across the rest.");
+});
+
+test("a part may not reach into a transaction that is in another slice", () => {
+  const r = reconcileIds(
+    makePayload(),
+    submit({
+      slices: [
+        { label: "A", ordinals: [1], parts: [{ label: "sneak", ordinals: [1, 2] }] },
+        { label: "B", ordinals: [2] },
+      ],
+    }),
+  );
+  assert.ok(r.errors.some((e) => e.includes("is not in that slice")), r.errors.join(" | "));
+});
+
+test("no parts leaves no remainder, rather than one part called everything else", () => {
+  const r = reconcileIds(makePayload(), submit({ slices: [{ label: "Trip", ordinals: [1, 2] }] }));
+  assert.deepEqual(r.slices[0].parts, []);
+});
+
+test("the transactions behind every slice, part and group are stored", () => {
+  const r = reconcileIds(
+    makePayload(),
+    submit({
+      slices: [{ label: "Trip", ordinals: [1, 2], parts: [{ label: "Stays", ordinals: [1] }] }],
+    }),
+  );
+  assert.deepEqual(r.slices[0].txn_ids, ["tx-one", "tx-two"]);
+  assert.deepEqual(r.slices[0].parts![0].txn_ids, ["tx-one"]);
+  assert.deepEqual(r.slices[0].parts![1].txn_ids, ["tx-two"]);
+  assert.deepEqual(r.breakdowns.find((b) => b.category === "a")!.groups[0].txn_ids, ["tx-one"]);
+});
+
+test("without an id map nothing claims to know which rows these were", () => {
+  const r = reconcile(makePayload(), submit({ slices: [{ label: "Trip", ordinals: [1, 2] }] }));
+  assert.equal("txn_ids" in r.slices[0], false);
+});

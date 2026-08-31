@@ -191,7 +191,20 @@ export async function loadStoredBreakdowns(userId: string, month: string): Promi
   return (data?.category_breakdowns as StoredBreakdown[]) ?? [];
 }
 
+/** The payload never carries transaction ids: the agent works in ordinals so it
+ *  cannot address a row directly. The map is returned alongside so the server
+ *  can write real ids into what it stores, which is what makes a stored line
+ *  traceable back to its transactions later. */
+export interface BuiltPayload {
+  payload: ReviewPayload;
+  idByOrdinal: Map<number, string>;
+}
+
 export async function buildReviewPayload(userId: string, month: string): Promise<ReviewPayload> {
+  return (await buildReviewPayloadWithIds(userId, month)).payload;
+}
+
+export async function buildReviewPayloadWithIds(userId: string, month: string): Promise<BuiltPayload> {
   const [y, m] = month.split("-").map(Number);
   // Padded UTC window so IST month-edge transactions are never missed.
   const windowStart = new Date(Date.UTC(y, m - 1, 1) - 36 * 3600 * 1000).toISOString();
@@ -288,6 +301,7 @@ export async function buildReviewPayload(userId: string, month: string): Promise
   let totalSpent = 0;
   let totalIncome = 0;
   let n = 0;
+  const idByOrdinal = new Map<number, string>();
 
   for (const t of txnsRaw) {
     if (istYearMonth(t.transacted_at) !== month) continue;
@@ -333,6 +347,7 @@ export async function buildReviewPayload(userId: string, month: string): Promise
 
     const item = itemsByKey.get(key) ?? { key, kind, name, slug, total: 0, txns: [] };
     n += 1;
+    idByOrdinal.set(n, t.id);
     item.txns.push({
       n,
       d: istDay(t.transacted_at),
@@ -383,7 +398,7 @@ export async function buildReviewPayload(userId: string, month: string): Promise
     storedBreakdowns.map((b) => [b.category ?? "", b.fingerprint ?? null]),
   );
 
-  return {
+  const payload: ReviewPayload = {
     month,
     timezone: TZ,
     totals: { spent: totalSpent, income: totalIncome },
@@ -415,6 +430,7 @@ export async function buildReviewPayload(userId: string, month: string): Promise
     known_slice_labels: [...sliceLabels].sort(),
     known_group_labels: [...groupLabels].sort(),
   };
+  return { payload, idByOrdinal };
 }
 
 export const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
@@ -429,6 +445,12 @@ const GroupingSchema = z.object({
  *  names, so the prose is the agent's and the arithmetic still is not. */
 const SliceSchema = GroupingSchema.extend({
   one_liner: z.string().max(300).nullable().default(null),
+  /** Named sub-buckets inside the slice. They exist so the line can say
+   *  "bike rentals ₹5,663" for a 35-transaction trip: without them the only
+   *  computed figures are single charges, so a big slice could only ever name
+   *  two or three of its rows. Parts need not cover the slice; the server
+   *  computes what is left over rather than trusting a subtraction. */
+  parts: z.array(GroupingSchema).max(12).default([]),
 });
 export const ReviewSubmissionSchema = z.object({
   month: z.string().regex(MONTH_RE),
@@ -469,9 +491,16 @@ interface ReconciledGroup {
   label: string;
   amount: number;
   count: number;
+  /** The transactions behind this figure. The agent never sees these; the
+   *  server resolves them from the ordinals it was given, so a stored line can
+   *  always be opened back up into the rows that produced it. */
+  txn_ids?: string[];
   /** Slices only. Present but null means "checked, nothing to say"; absent means
    *  the row predates slice one-liners, which is what marks a month stale. */
   one_liner?: string | null;
+  /** Slices only. The last entry is the server's own remainder when the parts
+   *  do not cover the slice; it is computed, never submitted. */
+  parts?: ReconciledGroup[];
 }
 
 // Caps the error list so a pathological submission (millions of foreign
@@ -488,12 +517,14 @@ export function reconcilePartition(
   groups: { label: string; ordinals: number[]; one_liner?: string | null }[],
   expectedTotal: number,
   errors: string[],
+  idByOrdinal?: Map<number, string>,
 ): ReconciledGroup[] {
   const seen = new Set<number>();
   const out: ReconciledGroup[] = [];
   for (const g of groups) {
     let sum = 0;
     let count = 0;
+    const ids: string[] = [];
     for (const o of g.ordinals) {
       if (!txnsByN.has(o)) {
         pushError(errors, `${scope}: ordinal ${o} in "${g.label}" is not in scope`);
@@ -506,12 +537,15 @@ export function reconcilePartition(
       seen.add(o);
       sum = round2(sum + txnsByN.get(o)!);
       count++;
+      const id = idByOrdinal?.get(o);
+      if (id) ids.push(id);
     }
     if (count > 0) {
       out.push({
         label: g.label,
         amount: round2(sum),
         count,
+        ...(idByOrdinal && { txn_ids: ids }),
         ...(g.one_liner !== undefined && { one_liner: g.one_liner }),
       });
     }
@@ -551,6 +585,67 @@ export function verifyFigures(
       pushError(errors, `${scope}: ₹${m[1]} in the summary is not a group total, a transaction, or the day total`);
     }
   }
+}
+
+/**
+ * Sub-buckets inside one slice. Unlike a partition these need not cover the
+ * slice: the agent names the destinations worth naming and the server adds a
+ * remainder for the rest, so the line can end with "and X across the others"
+ * without anyone doing arithmetic by hand.
+ *
+ * A part may only cite ordinals its own slice holds. Otherwise a "stays" part
+ * could quietly pull in a charge that lives in a different slice and the sum
+ * under the label would describe something the label does not.
+ */
+export function reconcileParts(
+  scope: string,
+  sliceOrdinals: number[],
+  sliceTotal: number,
+  parts: { label: string; ordinals: number[] }[],
+  amountByN: Map<number, number>,
+  errors: string[],
+  idByOrdinal?: Map<number, string>,
+): ReconciledGroup[] {
+  const mine = new Set(sliceOrdinals);
+  const claimed = new Set<number>();
+  const out: ReconciledGroup[] = [];
+
+  for (const p of parts) {
+    let sum = 0;
+    let count = 0;
+    const ids: string[] = [];
+    for (const o of p.ordinals) {
+      if (!mine.has(o)) {
+        pushError(errors, `${scope}: ordinal ${o} in part "${p.label}" is not in that slice`);
+        continue;
+      }
+      if (claimed.has(o)) {
+        pushError(errors, `${scope}: ordinal ${o} is in two parts`);
+        continue;
+      }
+      claimed.add(o);
+      sum = round2(sum + (amountByN.get(o) ?? 0));
+      count++;
+      const id = idByOrdinal?.get(o);
+      if (id) ids.push(id);
+    }
+    if (count > 0) {
+      out.push({ label: p.label, amount: round2(sum), count, ...(idByOrdinal && { txn_ids: ids }) });
+    }
+  }
+
+  const rest = sliceOrdinals.filter((o) => !claimed.has(o));
+  if (out.length > 0 && rest.length > 0) {
+    const amount = round2(rest.reduce((t, o) => t + (amountByN.get(o) ?? 0), 0));
+    const ids = rest.map((o) => idByOrdinal?.get(o)).filter((v): v is string => !!v);
+    out.push({ label: "Everything else", amount, count: rest.length, ...(idByOrdinal && { txn_ids: ids }) });
+  }
+
+  const summed = round2(out.reduce((t, g) => t + g.amount, 0));
+  if (out.length > 0 && Math.abs(summed - sliceTotal) >= 0.01) {
+    pushError(errors, `${scope}: parts sum to \u20b9${summed}, slice holds \u20b9${sliceTotal}`);
+  }
+  return out;
 }
 
 /** Prose the agent wrote, returned only if every rupee in it is one the server
@@ -665,6 +760,7 @@ export function reconcileSubmission(
   submission: ReviewSubmission,
   stored: StoredBreakdown[] = [],
   currentMonth: string = currentIstMonth(),
+  idByOrdinal?: Map<number, string>,
 ): ReconciledSubmission {
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -720,7 +816,7 @@ export function reconcileSubmission(
       continue;
     }
     const byN = new Map(item.txns.map((t) => [t.n, t.amount]));
-    const groups = reconcilePartition(item.name, byN, sub.groups, item.total, errors);
+    const groups = reconcilePartition(item.name, byN, sub.groups, item.total, errors, idByOrdinal);
     const oneLiner = checkedProse(
       `${item.name} one-liner`,
       sub.one_liner,
@@ -741,18 +837,32 @@ export function reconcileSubmission(
   let slices: ReconciledGroup[] = [];
   if (submission.slices.length > 0) {
     const allByN = new Map(payload.items.flatMap((it) => it.txns.map((t) => [t.n, t.amount] as const)));
-    slices = reconcilePartition("slices", allByN, submission.slices, payload.totals.spent, errors);
-    // A slice line may name the things bought or the slice's own total. It may
-    // not name a subtotal of its own invention, because nothing computed one.
+    slices = reconcilePartition("slices", allByN, submission.slices, payload.totals.spent, errors, idByOrdinal);
     const submittedByLabel = new Map(submission.slices.map((sl) => [sl.label, sl]));
     slices = slices.map((sl) => {
       const sub = submittedByLabel.get(sl.label);
       if (!sub) return sl;
+      const parts = reconcileParts(
+        `slice "${sl.label}"`,
+        sub.ordinals,
+        sl.amount,
+        sub.parts,
+        allByN,
+        errors,
+        idByOrdinal,
+      );
+      // The line may name a part, a single charge, or the slice's own total.
+      // Nothing else, because nothing else was computed.
       const allowed = [
+        ...parts.map((p) => p.amount),
         ...sub.ordinals.map((o) => allByN.get(o)).filter((a): a is number => a !== undefined),
         sl.amount,
       ];
-      return { ...sl, one_liner: checkedProse(`slice "${sl.label}"`, sl.one_liner ?? null, allowed, warnings) };
+      return {
+        ...sl,
+        parts,
+        one_liner: checkedProse(`slice "${sl.label}"`, sl.one_liner ?? null, allowed, warnings),
+      };
     });
   }
 
@@ -780,6 +890,7 @@ export async function storeReview(
   userId: string,
   payload: ReviewPayload,
   submission: ReviewSubmission,
+  idByOrdinal?: Map<number, string>,
 ): Promise<
   | { errors: string[] }
   | { stored: true; warnings: string[]; items: number; carried: number; slices: number; days: number }
@@ -795,6 +906,8 @@ export async function storeReview(
     payload,
     submission,
     (priorRow?.category_breakdowns as StoredBreakdown[]) ?? [],
+    undefined,
+    idByOrdinal,
   );
   if (errors.length > 0) return { errors };
 

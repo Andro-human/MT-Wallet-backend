@@ -5,6 +5,7 @@ import { z } from "zod";
 import { getUserByApiKey } from "../services/supabase.js";
 import {
   buildReviewPayload,
+  buildReviewPayloadWithIds,
   storeReview,
   currentIstMonth,
   ReviewSubmissionSchema,
@@ -78,8 +79,8 @@ function buildServer(userId: string): McpServer {
         ...args,
         month: args.month ?? currentIstMonth(),
       });
-      const payload = await buildReviewPayload(userId, submission.month);
-      const result = await storeReview(userId, payload, submission);
+      const { payload, idByOrdinal } = await buildReviewPayloadWithIds(userId, submission.month);
+      const result = await storeReview(userId, payload, submission, idByOrdinal);
       if ("errors" in result) {
         return {
           ...text({

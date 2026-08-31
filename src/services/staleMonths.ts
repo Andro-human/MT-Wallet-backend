@@ -26,8 +26,9 @@ export interface MonthStatus {
    *  rewritten in full on any submission, so a month in this state needs only
    *  the highlights resubmitted, not its categories regrouped. */
   highlights_stale: boolean;
-  /** Stored slices predate slice one-liners. Absent is the signal, not null:
-   *  null is a checked "nothing to say" and must not requeue the month forever. */
+  /** Stored slices predate the current slice shape. Absence of the field is the
+   *  signal, not a null value: a stored null one-liner is a checked "nothing to
+   *  say" and must not requeue the month forever. */
   slices_stale: boolean;
   needs_work: boolean;
 }
@@ -47,14 +48,15 @@ export function statusOf(
   payload: ReviewPayload,
   hasReview: boolean,
   storedHighlights: string[] = [],
-  storedSlices: { one_liner?: string | null }[] = [],
+  storedSlices: { one_liner?: string | null; txn_ids?: string[] }[] = [],
 ): MonthStatus {
   const items_stale = payload.items.filter((i) => i.needs_regen).length;
   const days_stale = payload.days.filter((d) => d.needs_summary).length;
   const highlights_stale =
     hasReview &&
     totalsInHighlights(storedHighlights, payload.totals.spent, payload.totals.income).length > 0;
-  const slices_stale = storedSlices.length > 0 && storedSlices.some((s) => !("one_liner" in s));
+  const slices_stale =
+    storedSlices.length > 0 && storedSlices.some((s) => !("one_liner" in s) || !("txn_ids" in s));
   return {
     month,
     has_review: hasReview,
@@ -106,7 +108,9 @@ export async function findStaleMonths(
       r.month,
       {
         highlights: Array.isArray(r.highlights) ? (r.highlights as string[]) : [],
-        slices: Array.isArray(r.spend_slices) ? (r.spend_slices as { one_liner?: string | null }[]) : [],
+        slices: Array.isArray(r.spend_slices)
+          ? (r.spend_slices as { one_liner?: string | null; txn_ids?: string[] }[])
+          : [],
       },
     ]),
   );
