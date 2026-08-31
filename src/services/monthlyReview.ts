@@ -423,6 +423,13 @@ const GroupingSchema = z.object({
   label: z.string().min(1).max(120),
   ordinals: z.array(z.number().int()).min(1).max(2000),
 });
+/** A slice says where a theme's money actually went, at the granularity of the
+ *  things bought. The wedge in "Where it went" is the label; this is the line
+ *  under it. Every figure in it is checked against the transactions the slice
+ *  names, so the prose is the agent's and the arithmetic still is not. */
+const SliceSchema = GroupingSchema.extend({
+  one_liner: z.string().max(300).nullable().default(null),
+});
 export const ReviewSubmissionSchema = z.object({
   month: z.string().regex(MONTH_RE),
   /** Declares this as the catch-up run, the only caller allowed to write a month
@@ -444,7 +451,7 @@ export const ReviewSubmissionSchema = z.object({
     )
     .max(200)
     .default([]),
-  slices: z.array(GroupingSchema).max(60).default([]),
+  slices: z.array(SliceSchema).max(60).default([]),
   days: z
     .array(
       z.object({
@@ -462,6 +469,9 @@ interface ReconciledGroup {
   label: string;
   amount: number;
   count: number;
+  /** Slices only. Present but null means "checked, nothing to say"; absent means
+   *  the row predates slice one-liners, which is what marks a month stale. */
+  one_liner?: string | null;
 }
 
 // Caps the error list so a pathological submission (millions of foreign
@@ -475,7 +485,7 @@ function pushError(errors: string[], msg: string) {
 export function reconcilePartition(
   scope: string,
   txnsByN: Map<number, number>,
-  groups: { label: string; ordinals: number[] }[],
+  groups: { label: string; ordinals: number[]; one_liner?: string | null }[],
   expectedTotal: number,
   errors: string[],
 ): ReconciledGroup[] {
@@ -497,7 +507,14 @@ export function reconcilePartition(
       sum = round2(sum + txnsByN.get(o)!);
       count++;
     }
-    if (count > 0) out.push({ label: g.label, amount: round2(sum), count });
+    if (count > 0) {
+      out.push({
+        label: g.label,
+        amount: round2(sum),
+        count,
+        ...(g.one_liner !== undefined && { one_liner: g.one_liner }),
+      });
+    }
   }
   if (seen.size !== txnsByN.size) {
     const missing = [...txnsByN.keys()].filter((k) => !seen.has(k));
@@ -534,6 +551,22 @@ export function verifyFigures(
       pushError(errors, `${scope}: ₹${m[1]} in the summary is not a group total, a transaction, or the day total`);
     }
   }
+}
+
+/** Prose the agent wrote, returned only if every rupee in it is one the server
+ *  computed. Otherwise null and a warning: a line is worth less than a month. */
+export function checkedProse(
+  scope: string,
+  prose: string | null,
+  allowed: number[],
+  warnings: string[],
+): string | null {
+  if (!prose) return null;
+  const bad: string[] = [];
+  verifyFigures(scope, prose, allowed, bad);
+  if (bad.length === 0) return prose;
+  warnings.push(`${scope}: dropped, ${bad[0]}`);
+  return null;
 }
 
 /** The month's own totals are not an insight. They are printed at the top of the
@@ -597,6 +630,10 @@ export function reconcileDays(
 
 export interface ReconciledSubmission {
   errors: string[];
+  /** Prose the server refused to store, having found a figure in it that it
+   *  never computed. Dropping the sentence loses a line; erroring would lose
+   *  the month, and a bad one-liner is not worth a month. */
+  warnings: string[];
   breakdowns: {
     category: string | null;
     name: string;
@@ -630,6 +667,7 @@ export function reconcileSubmission(
   currentMonth: string = currentIstMonth(),
 ): ReconciledSubmission {
   const errors: string[] = [];
+  const warnings: string[] = [];
 
   if (payload.month !== currentMonth && !submission.catch_up) {
     pushError(
@@ -683,11 +721,17 @@ export function reconcileSubmission(
     }
     const byN = new Map(item.txns.map((t) => [t.n, t.amount]));
     const groups = reconcilePartition(item.name, byN, sub.groups, item.total, errors);
+    const oneLiner = checkedProse(
+      `${item.name} one-liner`,
+      sub.one_liner,
+      [...groups.map((g) => g.amount), ...item.txns.map((t) => t.amount), round2(item.total)],
+      warnings,
+    );
     breakdowns.push({
       category: item.kind === "group" ? item.key : item.slug,
       name: item.name,
       total: round2(item.total),
-      one_liner: sub.one_liner,
+      one_liner: oneLiner,
       groups,
       reconciled: true,
       fingerprint: item.fingerprint,
@@ -698,6 +742,18 @@ export function reconcileSubmission(
   if (submission.slices.length > 0) {
     const allByN = new Map(payload.items.flatMap((it) => it.txns.map((t) => [t.n, t.amount] as const)));
     slices = reconcilePartition("slices", allByN, submission.slices, payload.totals.spent, errors);
+    // A slice line may name the things bought or the slice's own total. It may
+    // not name a subtotal of its own invention, because nothing computed one.
+    const submittedByLabel = new Map(submission.slices.map((sl) => [sl.label, sl]));
+    slices = slices.map((sl) => {
+      const sub = submittedByLabel.get(sl.label);
+      if (!sub) return sl;
+      const allowed = [
+        ...sub.ordinals.map((o) => allByN.get(o)).filter((a): a is number => a !== undefined),
+        sl.amount,
+      ];
+      return { ...sl, one_liner: checkedProse(`slice "${sl.label}"`, sl.one_liner ?? null, allowed, warnings) };
+    });
   }
 
   for (const hit of totalsInHighlights(
@@ -713,7 +769,7 @@ export function reconcileSubmission(
 
   const days = reconcileDays(payload, submission, errors);
 
-  return { errors, breakdowns, carried, slices, days };
+  return { errors, warnings, breakdowns, carried, slices, days };
 }
 
 /**
@@ -726,7 +782,7 @@ export async function storeReview(
   submission: ReviewSubmission,
 ): Promise<
   | { errors: string[] }
-  | { stored: true; items: number; carried: number; slices: number; days: number }
+  | { stored: true; warnings: string[]; items: number; carried: number; slices: number; days: number }
 > {
   const { data: priorRow } = await supabase
     .from("monthly_summaries")
@@ -735,7 +791,7 @@ export async function storeReview(
     .eq("month", payload.month)
     .maybeSingle();
 
-  const { errors, breakdowns, carried, slices, days } = reconcileSubmission(
+  const { errors, warnings, breakdowns, carried, slices, days } = reconcileSubmission(
     payload,
     submission,
     (priorRow?.category_breakdowns as StoredBreakdown[]) ?? [],
@@ -813,8 +869,10 @@ export async function storeReview(
       `${breakdowns.length} items (${carried} carried), ` +
       `${storedSlices.length} slices${submission.slices.length === 0 ? " (carried over)" : ""}, ${days.length} days`,
   );
+  if (warnings.length > 0) console.log(`[review] ${payload.month}: ${warnings.join("; ")}`);
   return {
     stored: true,
+    warnings,
     items: breakdowns.length,
     carried,
     slices: storedSlices.length,

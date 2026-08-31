@@ -494,3 +494,59 @@ test("a zero income month does not treat every zero as a forbidden total", () =>
   assert.deepEqual(totalsInHighlights(["Nothing cost \u20b90."], 200, 0), []);
 });
 
+
+// ─── Slice one-liners ───────────────────────────────────────────────────────
+
+const withSlices = (slices: unknown[]) => submit({ slices });
+
+test("a slice one-liner naming the things bought is kept", () => {
+  const r = reconcile(
+    makePayload(),
+    withSlices([{ label: "S", ordinals: [1, 2], one_liner: "₹100 here and ₹100 there." }]),
+  );
+  assert.deepEqual(r.errors, []);
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.slices[0].one_liner, "₹100 here and ₹100 there.");
+});
+
+test("a slice one-liner may name the slice's own total", () => {
+  const r = reconcile(
+    makePayload(),
+    withSlices([{ label: "S", ordinals: [1, 2], one_liner: "₹200 across two things." }]),
+  );
+  assert.deepEqual(r.warnings, []);
+  assert.equal(r.slices[0].one_liner, "₹200 across two things.");
+});
+
+test("a slice one-liner inventing a subtotal loses the line, not the month", () => {
+  const r = reconcile(
+    makePayload(),
+    withSlices([{ label: "S", ordinals: [1, 2], one_liner: "₹150 of it was the big one." }]),
+  );
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.slices[0].one_liner, null);
+  assert.ok(r.warnings.some((w) => w.includes('slice "S"')), r.warnings.join(" | "));
+});
+
+test("a slice with nothing to say stores null, which is not the same as missing", () => {
+  const r = reconcile(makePayload(), withSlices([{ label: "S", ordinals: [1, 2] }]));
+  assert.deepEqual(r.errors, []);
+  assert.ok("one_liner" in r.slices[0]);
+  assert.equal(r.slices[0].one_liner, null);
+});
+
+test("category one-liners are checked the same way and may cite a group total", () => {
+  const r = reconcile(
+    makePayload(),
+    submit({
+      items: [
+        { key: "cat:a", one_liner: "₹100 of x.", groups: [{ label: "x", ordinals: [1] }] },
+        { key: "group:b", one_liner: "₹99 of nothing.", groups: [{ label: "y", ordinals: [2] }] },
+      ],
+    }),
+  );
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.breakdowns.find((b) => b.category === "a")!.one_liner, "₹100 of x.");
+  assert.equal(r.breakdowns.find((b) => b.category === "group:b")!.one_liner, null);
+  assert.ok(r.warnings.some((w) => w.includes("B one-liner")), r.warnings.join(" | "));
+});

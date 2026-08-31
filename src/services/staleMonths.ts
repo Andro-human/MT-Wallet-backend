@@ -26,6 +26,9 @@ export interface MonthStatus {
    *  rewritten in full on any submission, so a month in this state needs only
    *  the highlights resubmitted, not its categories regrouped. */
   highlights_stale: boolean;
+  /** Stored slices predate slice one-liners. Absent is the signal, not null:
+   *  null is a checked "nothing to say" and must not requeue the month forever. */
+  slices_stale: boolean;
   needs_work: boolean;
 }
 
@@ -44,12 +47,14 @@ export function statusOf(
   payload: ReviewPayload,
   hasReview: boolean,
   storedHighlights: string[] = [],
+  storedSlices: { one_liner?: string | null }[] = [],
 ): MonthStatus {
   const items_stale = payload.items.filter((i) => i.needs_regen).length;
   const days_stale = payload.days.filter((d) => d.needs_summary).length;
   const highlights_stale =
     hasReview &&
     totalsInHighlights(storedHighlights, payload.totals.spent, payload.totals.income).length > 0;
+  const slices_stale = storedSlices.length > 0 && storedSlices.some((s) => !("one_liner" in s));
   return {
     month,
     has_review: hasReview,
@@ -57,8 +62,9 @@ export function statusOf(
     items_total: payload.items.length,
     days_stale,
     highlights_stale,
+    slices_stale,
     // A month with no counted spend has nothing to write, review row or not.
-    needs_work: items_stale > 0 || days_stale > 0 || highlights_stale,
+    needs_work: items_stale > 0 || days_stale > 0 || highlights_stale || slices_stale,
   };
 }
 
@@ -91,14 +97,17 @@ export async function findStaleMonths(
 
   const { data: reviewed, error } = await supabase
     .from("monthly_summaries")
-    .select("month, highlights")
+    .select("month, highlights, spend_slices")
     .eq("user_id", userId)
     .in("month", window);
   if (error) throw new Error(`monthly_summaries: ${error.message}`);
   const stored = new Map(
-    (reviewed ?? []).map((r: { month: string; highlights: unknown }) => [
+    (reviewed ?? []).map((r: { month: string; highlights: unknown; spend_slices: unknown }) => [
       r.month,
-      Array.isArray(r.highlights) ? (r.highlights as string[]) : [],
+      {
+        highlights: Array.isArray(r.highlights) ? (r.highlights as string[]) : [],
+        slices: Array.isArray(r.spend_slices) ? (r.spend_slices as { one_liner?: string | null }[]) : [],
+      },
     ]),
   );
 
@@ -107,7 +116,8 @@ export async function findStaleMonths(
       month,
       await buildReviewPayload(userId, month),
       stored.has(month),
-      stored.get(month) ?? [],
+      stored.get(month)?.highlights ?? [],
+      stored.get(month)?.slices ?? [],
     ),
   );
 
