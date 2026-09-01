@@ -33,6 +33,97 @@ import type { ParsedTransactionResult, SMSMessage, User } from "../types/index.j
 import type { TransactionInsert } from "../schemas/transaction.js";
 import { env } from "../config/env.js";
 
+/** The subset of a merchant rule that decides whether it applies and what it sets. */
+export interface MerchantRule {
+  raw_merchant: string;
+  mapped_merchant?: string | null;
+  match_type?: string | null;
+  default_category_id?: string | null;
+  default_is_expense?: boolean | null;
+  default_is_income?: boolean | null;
+  amount_operator?: string | null;
+  amount_threshold?: number | null;
+  date_operator?: string | null;
+  date_threshold?: number | null;
+}
+
+export function evaluateRule(
+  rule: MerchantRule,
+  amount: number,
+  currentMerchant: string,
+  transactedAt: string,
+): boolean {
+  const ruleVal = (rule.raw_merchant ?? "").toLowerCase();
+  const currentVal = currentMerchant.toLowerCase();
+
+  const isNameMatch =
+    rule.match_type === "contains" ? currentVal.includes(ruleVal) : currentVal === ruleVal;
+  if (!isNameMatch) return false;
+
+  if (rule.amount_operator && rule.amount_threshold !== null && rule.amount_threshold !== undefined) {
+    const t = rule.amount_threshold;
+    switch (rule.amount_operator) {
+      case "<": if (!(amount < t)) return false; break;
+      case "<=": if (!(amount <= t)) return false; break;
+      case ">": if (!(amount > t)) return false; break;
+      case ">=": if (!(amount >= t)) return false; break;
+      case "=": if (!(amount === t)) return false; break;
+    }
+  }
+
+  if (rule.date_operator && rule.date_threshold !== null && rule.date_threshold !== undefined && transactedAt) {
+    const dayOfMonth = new Date(transactedAt).getDate();
+    const t = rule.date_threshold;
+    switch (rule.date_operator) {
+      case "<": if (!(dayOfMonth < t)) return false; break;
+      case "<=": if (!(dayOfMonth <= t)) return false; break;
+      case ">": if (!(dayOfMonth > t)) return false; break;
+      case ">=": if (!(dayOfMonth >= t)) return false; break;
+      case "=": if (!(dayOfMonth === t)) return false; break;
+    }
+  }
+
+  return true;
+}
+
+export interface ResolvedOverrides {
+  matched: number;
+  merchant: string | null;
+  categoryId: string | null;
+  isExpense: boolean | null;
+  isIncome: boolean | null;
+}
+
+/**
+ * Fold EVERY matching rule, not just the first.
+ *
+ * Two rules may share a raw_merchant and set different fields. A self-transfer
+ * had one rule saying "not income" and another saying "not expense"; stopping at
+ * the first match filed a \u20b920,000 transfer as spending, because the rule that
+ * said otherwise was never read. Earlier matches still win per field, so a
+ * single rule behaves exactly as it did before.
+ */
+export function resolveMerchantRules(
+  rules: MerchantRule[],
+  ctx: { amount: number; merchant: string; transactedAt: string },
+): ResolvedOverrides {
+  const matched = rules.filter((r) => evaluateRule(r, ctx.amount, ctx.merchant, ctx.transactedAt));
+  const firstSet = <T>(pick: (r: MerchantRule) => T | null | undefined): T | null => {
+    for (const r of matched) {
+      const v = pick(r);
+      if (v !== null && v !== undefined) return v;
+    }
+    return null;
+  };
+  return {
+    matched: matched.length,
+    merchant: firstSet((r) => r.mapped_merchant || null),
+    categoryId: firstSet((r) => r.default_category_id || null),
+    isExpense: firstSet((r) => r.default_is_expense),
+    isIncome: firstSet((r) => r.default_is_income),
+  };
+}
+
 const router = Router();
 
 function sanitizeErrorForStorage(error: unknown): string {
@@ -217,49 +308,6 @@ async function processMessagesInBackgroundUnlocked(
       overridesMap.get(key)!.push(override);
     }
 
-    // Helper to evaluate if a rule matches
-    const evaluateRule = (rule: typeof userOverrides[0], amount: number, currentMerchant: string, transactedAt: string) => {
-      // 1. Check merchant name match based on match_type
-      const ruleVal = rule.raw_merchant.toLowerCase();
-      const currentVal = currentMerchant.toLowerCase();
-
-      let isNameMatch = false;
-      if (rule.match_type === 'contains') {
-        isNameMatch = currentVal.includes(ruleVal);
-      } else {
-        isNameMatch = currentVal === ruleVal;
-      }
-
-      if (!isNameMatch) return false;
-
-      // 2. Check amount conditions if specified
-      if (rule.amount_operator && rule.amount_threshold !== null) {
-        switch (rule.amount_operator) {
-          case '<': if (!(amount < rule.amount_threshold)) return false; break;
-          case '<=': if (!(amount <= rule.amount_threshold)) return false; break;
-          case '>': if (!(amount > rule.amount_threshold)) return false; break;
-          case '>=': if (!(amount >= rule.amount_threshold)) return false; break;
-          case '=': if (!(amount === rule.amount_threshold)) return false; break;
-        }
-      }
-
-      // 3. Check date conditions if specified
-      if (rule.date_operator && rule.date_threshold !== null && transactedAt) {
-        const txDate = new Date(transactedAt);
-        const dayOfMonth = txDate.getDate(); // 1-31
-
-        switch (rule.date_operator) {
-          case '<': if (!(dayOfMonth < rule.date_threshold)) return false; break;
-          case '<=': if (!(dayOfMonth <= rule.date_threshold)) return false; break;
-          case '>': if (!(dayOfMonth > rule.date_threshold)) return false; break;
-          case '>=': if (!(dayOfMonth >= rule.date_threshold)) return false; break;
-          case '=': if (!(dayOfMonth === rule.date_threshold)) return false; break;
-        }
-      }
-
-      // Passed all specified conditions
-      return true;
-    };
 
     // Parse and categorize with AI
     let parsed;
@@ -365,29 +413,22 @@ async function processMessagesInBackgroundUnlocked(
       let mappingApplied = false;
 
       if (finalMerchant) {
-        let matchedRule: typeof userOverrides[0] | null = null;
+        const resolved = resolveMerchantRules(userOverrides, {
+          amount: amountINR,
+          merchant: finalMerchant,
+          transactedAt: msg.timestamp,
+        });
 
-        for (const rule of userOverrides) {
-          if (evaluateRule(rule, amountINR, finalMerchant, msg.timestamp)) {
-            matchedRule = rule;
-            break; // Stop at first matched rule
-          }
-        }
-
-        if (matchedRule) {
-          console.log(`${logPrefix} [Override] Re-mapped merchant "${finalMerchant}" → "${matchedRule.mapped_merchant}"`);
-          finalMerchant = matchedRule.mapped_merchant;
+        if (resolved.matched > 0) {
+          console.log(
+            `${logPrefix} [Override] ${resolved.matched} rule(s) matched "${finalMerchant}" → "${resolved.merchant ?? finalMerchant}"`,
+          );
+          if (resolved.merchant) finalMerchant = resolved.merchant;
           mappingApplied = true;
-
-          if (matchedRule.default_category_id) {
-            finalCategoryId = matchedRule.default_category_id;
-          }
-          if (matchedRule.default_is_expense !== undefined && matchedRule.default_is_expense !== null) {
-            overriddenIsExpense = matchedRule.default_is_expense;
-          }
-          if (matchedRule.default_is_income !== undefined && matchedRule.default_is_income !== null) {
-            overriddenIsIncome = matchedRule.default_is_income;
-          }
+          // A rule's category still overrides the one parsed from the SMS.
+          if (resolved.categoryId) finalCategoryId = resolved.categoryId;
+          overriddenIsExpense = resolved.isExpense;
+          overriddenIsIncome = resolved.isIncome;
         }
       }
 
