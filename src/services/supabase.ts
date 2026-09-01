@@ -100,7 +100,11 @@ export async function getUserMerchantMappings(userId: string): Promise<UserMerch
   const { data, error } = await supabase
     .from("user_merchant_mappings")
     .select("id, user_id, raw_merchant, mapped_merchant, default_category_id, default_is_expense, default_is_income, amount_operator, amount_threshold, date_operator, date_threshold, match_type")
-    .eq("user_id", userId);
+    .eq("user_id", userId)
+    // Oldest first, so that when two rules set the same field the winner is the
+    // one the app names as the winner. Without this the order is whatever
+    // Postgres returns and the outcome moves under you.
+    .order("created_at", { ascending: true });
 
   if (error) {
     console.error("Failed to get merchant mappings:", error.message);
