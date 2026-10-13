@@ -63,6 +63,35 @@ iOS Shortcut (Worker) → Backend API → Gemini (Groq fallback) → Supabase DB
 4. Valid, unique transactions are inserted into Supabase using the Service Role bypass.
 5. VAPID Web Push triggers an asynchronous notification to subscribed devices.
 
+## Chat about your spending (MCP)
+
+`/mcp/chat` is a read-only [MCP](https://modelcontextprotocol.io) server, so any MCP client can answer questions about your money. Every figure is computed server-side with the app's own rules (refund netting, duplicate exclusion, IST months, budget carry), so the AI only has to explain the numbers, not calculate them.
+
+| Tool | Answers |
+|---|---|
+| `get_overview` | Date range, month-by-month spent/income, category and group names |
+| `spend_summary` | Totals by category / group / merchant / account / month / week / day, optionally vs another period |
+| `search_transactions` | Individual transactions with notes, refunds, subscription and lending labels |
+| `get_month_review` | The nightly AI review: highlights, themes, category breakdowns, day summaries |
+| `budget_status` | Cap, carry-in, spent, remaining, weekly pace |
+| `list_subscriptions` | Cadence, monthly cost, next charge, charge history |
+| `list_debts` | Money lent, repaid and outstanding per person |
+
+The key is your `profiles.api_key`. Put it in the URL for clients that only take a URL, or send it as a Bearer header:
+
+```
+https://<backend-host>/mcp/chat/<api_key>
+https://<backend-host>/mcp/chat        + Authorization: Bearer <api_key>
+```
+
+- **ChatGPT**: Settings → Plugins → Add → *Add custom MCP server*. Use the URL with the key, no authentication.
+- **Claude (web / desktop)**: Settings → Connectors → *Add custom connector*. Use the URL with the key.
+- **Claude Code**: `claude mcp add --transport http mtwallet https://<backend-host>/mcp/chat --header "Authorization: Bearer <api_key>"`
+- **Gemini CLI**: in `~/.gemini/settings.json`, `"mcpServers": { "mtwallet": { "httpUrl": "https://<backend-host>/mcp/chat", "headers": { "Authorization": "Bearer <api_key>" } } }`
+- **Cursor**: in `mcp.json`, `"mcpServers": { "mtwallet": { "url": "https://<backend-host>/mcp/chat", "headers": { "Authorization": "Bearer <api_key>" } } }`
+
+`/mcp/<api_key>` (without `chat`) is the review pipeline's server. It can store reviews, so don't connect it to a chat client.
+
 ## Deployment
 
 This backend is a standard Node.js Express application, which means you can deploy it anywhere that supports Node environments (Vercel, Render, AWS, Azure, DigitalOcean, your own VPS, etc.).

@@ -20,7 +20,7 @@ const istDate = new Intl.DateTimeFormat("en-CA", {
   month: "2-digit",
   day: "2-digit",
 });
-const istDay = (iso: string) => istDate.format(new Date(iso));
+export const istDay = (iso: string) => istDate.format(new Date(iso));
 const istYearMonth = (iso: string) => istDay(iso).slice(0, 7);
 export const currentIstMonth = () => istDate.format(new Date()).slice(0, 7);
 
@@ -91,7 +91,7 @@ export interface ReviewPayload {
   known_group_labels: string[];
 }
 
-async function fetchAll<T>(
+export async function fetchAll<T>(
   table: string,
   columns: string,
   filter: (q: any) => any = (q) => q,
