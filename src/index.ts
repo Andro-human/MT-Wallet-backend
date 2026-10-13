@@ -37,6 +37,7 @@ async function main() {
     { default: reviewRoutes },
     { default: subscriptionRoutes },
     { default: mcpRoutes },
+    { default: chatMcpRoutes },
     gmailService,
     supabaseService,
     subscriptionSync,
@@ -51,6 +52,7 @@ async function main() {
     import("./routes/review.js"),
     import("./routes/subscriptions.js"),
     import("./routes/mcp.js"),
+    import("./routes/chatMcp.js"),
     import("./services/gmail.js"),
     import("./services/supabase.js"),
     import("./services/subscriptionSync.js"),
@@ -79,6 +81,9 @@ async function main() {
   app.use("/api/enrichment", enrichmentRoutes);
   app.use("/api/review", reviewRoutes);
   app.use("/api/subscriptions", subscriptionRoutes);
+  // Before /mcp/:token, which would otherwise take "chat" as a token.
+  app.use("/mcp/chat/:token", chatMcpRoutes);
+  app.use("/mcp/chat", chatMcpRoutes);
   app.use("/mcp/:token", mcpRoutes);
 
   // Root health check
