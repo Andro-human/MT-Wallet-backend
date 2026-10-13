@@ -3,8 +3,12 @@ import { fetchAll, istDay } from "./monthlyReview.js";
 
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
+export const UNCATEGORIZED = { slug: "uncategorized", name: "Uncategorized" } as const;
+
 export type LedgerStatus = "counted" | "duplicate" | "refunded" | "not_counted";
-export type LedgerKind = "expense" | "income" | "other";
+/** Money out or money in, from the row's direction. Whether it counts toward
+ *  spent or income is `status`. */
+export type LedgerKind = "expense" | "income";
 
 export interface Lending {
   type: "lent" | "repayment";
@@ -18,8 +22,8 @@ export interface LedgerTxn {
   merchant: string | null;
   note: string | null;
   amount: number;
-  /** amount less linked refunds (expense) or less the part allocated as a
-   *  refund (income). What every total in the app adds up. */
+  /** amount less linked refunds (debit) or less the part allocated as a
+   *  refund (credit). What every total in the app adds up. */
   net: number;
   refunded: number;
   kind: LedgerKind;
@@ -36,7 +40,6 @@ export interface LedgerTxn {
   service: string | null;
   subscription: string | null;
   account: string | null;
-  payment_method: string | null;
 }
 
 export interface RawTxn {
@@ -45,13 +48,20 @@ export interface RawTxn {
   merchant: string | null;
   notes: string | null;
   transacted_at: string;
+  direction: string | null;
   is_expense: boolean | null;
   is_income: boolean | null;
   category_id: string | null;
   group_id: string | null;
   bank_name: string | null;
   account_last4: string | null;
-  payment_method: string | null;
+}
+
+export interface SubscriptionLinkRow {
+  subscription_id: string;
+  transaction_id: string;
+  amount: number;
+  kind: string;
 }
 
 export interface LedgerInputs {
@@ -67,7 +77,7 @@ export interface LedgerInputs {
     budget_excluded: boolean | null;
     service_identity: string | null;
   }[];
-  subscriptionLinks: { transaction_id: string; kind: string; label: string }[];
+  subscriptionLinks: (SubscriptionLinkRow & { label: string })[];
 }
 
 export interface Ledger {
@@ -78,10 +88,13 @@ export interface Ledger {
   refundTotals: Map<string, number>;
   categories: LedgerInputs["categories"];
   groups: LedgerInputs["groups"];
+  subscriptionLinks: SubscriptionLinkRow[];
 }
 
-/** Same rules as buildReviewPayloadWithIds, so a chat answer and the monthly
- *  review agree to the paisa. */
+/** Classification is MT-Wallet's classifyTransaction (transactionMath.ts):
+ *  direction decides which flag counts. Un-marking a duplicate in the app sets
+ *  both is_expense and is_income, so reading the flags alone would book a
+ *  salary credit as spend. */
 export function resolveLedger(input: LedgerInputs): Ledger {
   const refundTotals = new Map<string, number>();
   const refundAllocations = new Map<string, number>();
@@ -110,28 +123,25 @@ export function resolveLedger(input: LedgerInputs): Ledger {
     combineTag.set(r.transaction_id, tag);
   }
 
-  const txns: LedgerTxn[] = input.txns.map((t) => {
+  // Offset paging can return a row twice when an insert lands mid-load.
+  const unique = new Map(input.txns.map((t) => [t.id, t]));
+
+  const txns: LedgerTxn[] = [...unique.values()].map((t) => {
     const amount = Number(t.amount);
-    let kind: LedgerKind = "other";
+    const isDebit = t.direction !== "credit";
+    const kind: LedgerKind = isDebit ? "expense" : "income";
     let net = 0;
     let refunded = 0;
     let status: LedgerStatus;
 
     if (duplicates.has(t.id)) {
       status = "duplicate";
-      kind = t.is_expense ? "expense" : t.is_income ? "income" : "other";
-    } else if (t.is_expense) {
-      kind = "expense";
-      refunded = round2(refundTotals.get(t.id) ?? 0);
-      net = round2(Math.max(amount - refunded, 0));
-      status = net > 0 ? "counted" : "refunded";
-    } else if (t.is_income) {
-      kind = "income";
-      refunded = round2(refundAllocations.get(t.id) ?? 0);
-      net = round2(Math.max(amount - refunded, 0));
-      status = net > 0 ? "counted" : "refunded";
-    } else {
+    } else if (!(isDebit ? t.is_expense : t.is_income)) {
       status = "not_counted";
+    } else {
+      refunded = round2((isDebit ? refundTotals : refundAllocations).get(t.id) ?? 0);
+      net = round2(Math.max(amount - refunded, 0));
+      status = net > 0 ? "counted" : "refunded";
     }
 
     const cat = t.category_id ? catById.get(t.category_id) : undefined;
@@ -149,8 +159,8 @@ export function resolveLedger(input: LedgerInputs): Ledger {
       kind,
       status,
       category_id: t.category_id,
-      category: cat?.name ?? "Uncategorized",
-      category_slug: cat?.slug ?? "uncategorized",
+      category: cat?.name ?? UNCATEGORIZED.name,
+      category_slug: cat?.slug ?? UNCATEGORIZED.slug,
       group_id: t.group_id,
       group: t.group_id ? (groupById.get(t.group_id)?.name ?? "Unknown Group") : null,
       combine: combineTag.get(t.id) ?? null,
@@ -159,7 +169,6 @@ export function resolveLedger(input: LedgerInputs): Ledger {
       service: enr?.service_identity ?? null,
       subscription: subByTxn.get(t.id) ?? null,
       account: t.bank_name ? `${t.bank_name}${t.account_last4 ? ` ••${t.account_last4}` : ""}` : null,
-      payment_method: t.payment_method,
     };
   });
 
@@ -170,6 +179,7 @@ export function resolveLedger(input: LedgerInputs): Ledger {
     refundTotals,
     categories: input.categories,
     groups: input.groups,
+    subscriptionLinks: input.subscriptionLinks.map(({ label: _label, ...link }) => link),
   };
 }
 
@@ -181,7 +191,7 @@ export async function loadLedger(userId: string): Promise<Ledger> {
     await Promise.all([
       fetchAll<RawTxn>(
         "transactions",
-        "id, amount, merchant, notes, transacted_at, is_expense, is_income, category_id, group_id, bank_name, account_last4, payment_method",
+        "id, amount, merchant, notes, transacted_at, direction, is_expense, is_income, category_id, group_id, bank_name, account_last4",
         mine,
       ),
       fetchAll<LedgerInputs["refundLinks"][number]>(
@@ -195,8 +205,18 @@ export async function loadLedger(userId: string): Promise<Ledger> {
         q.or(`is_system.eq.true,user_id.eq.${userId}`),
       ),
       fetchAll<LedgerInputs["groups"][number]>("transaction_groups", "id, name, archived_at", mine),
-      enrichmentRows(userId),
-      subscriptionLinkRows(userId),
+      pageBy<LedgerInputs["enrichment"][number]>(
+        "txn_enrichment",
+        "transaction_id, lending, budget_excluded, service_identity",
+        ["transaction_id"],
+        userId,
+      ),
+      pageBy<SubscriptionLinkRow>(
+        "subscription_transactions",
+        "subscription_id, transaction_id, amount, kind",
+        ["transaction_id", "subscription_id"],
+        userId,
+      ),
       supabase.from("subscriptions").select("id, label").eq("user_id", userId),
     ]);
   if (subs.error) throw new Error(`subscriptions: ${subs.error.message}`);
@@ -211,8 +231,8 @@ export async function loadLedger(userId: string): Promise<Ledger> {
     groups,
     enrichment,
     subscriptionLinks: subLinks.map((l) => ({
-      transaction_id: l.transaction_id,
-      kind: l.kind,
+      ...l,
+      amount: Number(l.amount),
       label: labelBySub.get(l.subscription_id) ?? "Unknown subscription",
     })),
   });
@@ -221,7 +241,7 @@ export async function loadLedger(userId: string): Promise<Ledger> {
 /** txn_enrichment and subscription_transactions have no `id` column, which
  *  fetchAll orders by. Paging needs a total order or rows repeat and vanish
  *  across page boundaries. */
-export async function pageBy<T>(table: string, columns: string, orderKeys: string[], userId: string): Promise<T[]> {
+async function pageBy<T>(table: string, columns: string, orderKeys: string[], userId: string): Promise<T[]> {
   const PAGE = 1000;
   const rows: T[] = [];
   for (let from = 0; ; from += PAGE) {
@@ -235,18 +255,18 @@ export async function pageBy<T>(table: string, columns: string, orderKeys: strin
   return rows;
 }
 
-const enrichmentRows = (userId: string) =>
-  pageBy<LedgerInputs["enrichment"][number]>(
-    "txn_enrichment",
-    "transaction_id, lending, budget_excluded, service_identity",
-    ["transaction_id"],
-    userId,
-  );
+const LEDGER_TTL_MS = 30_000;
+const cache = new Map<string, { at: number; ledger: Promise<Ledger> }>();
 
-const subscriptionLinkRows = (userId: string) =>
-  pageBy<{ transaction_id: string; subscription_id: string; kind: string }>(
-    "subscription_transactions",
-    "transaction_id, subscription_id, kind",
-    ["transaction_id", "subscription_id"],
-    userId,
-  );
+/** One chat turn is several stateless tool calls in quick succession; a short
+ *  cache lets them share one full-history load. */
+export function cachedLedger(userId: string, now = Date.now()): Promise<Ledger> {
+  const hit = cache.get(userId);
+  if (hit && now - hit.at < LEDGER_TTL_MS) return hit.ledger;
+  const ledger = loadLedger(userId);
+  cache.set(userId, { at: now, ledger });
+  ledger.catch(() => {
+    if (cache.get(userId)?.ledger === ledger) cache.delete(userId);
+  });
+  return ledger;
+}

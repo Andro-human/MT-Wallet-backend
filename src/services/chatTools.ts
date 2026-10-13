@@ -1,4 +1,5 @@
-import type { Ledger, LedgerTxn } from "./spendLedger.js";
+import { UNCATEGORIZED, type Ledger, type LedgerTxn } from "./spendLedger.js";
+import type { Cadence } from "./proposalMath.js";
 import {
   attributeTo,
   buildBudgetIndex,
@@ -22,7 +23,8 @@ export interface Period {
   to: string;
 }
 
-const PERIOD_RE = /^\d{4}(-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?)?$/;
+const PERIOD_RE = /^20\d{2}(-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?)?$/;
+const EARLIEST = "2000-01-01";
 
 function daysInMonth(y: number, m: number): number {
   return new Date(Date.UTC(y, m, 0)).getUTCDate();
@@ -43,19 +45,36 @@ function endOf(token: string): string {
   return token;
 }
 
-/** Each bound is YYYY, YYYY-MM or YYYY-MM-DD, inclusive. A lone bound covers
- *  its own span, so from="2026-09" alone is all of September. Neither bound
- *  means the current month to date. */
-export function parsePeriod(from: string | undefined, to: string | undefined, today: string): Period {
-  for (const v of [from, to]) {
-    if (v !== undefined && !PERIOD_RE.test(v)) {
-      throw new ToolInputError(`"${v}" is not a date. Use YYYY, YYYY-MM or YYYY-MM-DD.`);
-    }
+function checkBound(v: string | undefined) {
+  if (v === undefined) return;
+  const bad = () => new ToolInputError(`"${v}" is not a date. Use YYYY, YYYY-MM or YYYY-MM-DD (years 2000-2099).`);
+  if (!PERIOD_RE.test(v)) throw bad();
+  if (v.length === 10) {
+    const [y, m, d] = v.split("-").map(Number);
+    if (d > daysInMonth(y, m)) throw bad();
   }
+}
+
+/** Bounds are YYYY, YYYY-MM or YYYY-MM-DD, each covering its whole span and
+ *  inclusive. from alone runs to today ("since"); to alone runs from the start
+ *  of the data; neither is the current month to date. */
+export function parsePeriod(from: string | undefined, to: string | undefined, today: string): Period {
+  checkBound(from);
+  checkBound(to);
   if (!from && !to) return { from: startOf(today.slice(0, 7)), to: today };
-  const period = { from: startOf(from ?? to!), to: endOf(to ?? from!) };
+  const period = { from: from ? startOf(from) : EARLIEST, to: to ? endOf(to) : today };
   if (period.from > period.to) throw new ToolInputError(`from (${period.from}) is after to (${period.to}).`);
   return period;
+}
+
+/** A comparison period needs both ends; one alone would silently compare
+ *  against "since X" or "up to X". */
+export function parseCompare(from: string | undefined, to: string | undefined, today: string): Period | undefined {
+  if (!from && !to) return undefined;
+  if (!from || !to) {
+    throw new ToolInputError("Pass both compare_from and compare_to, e.g. compare_from=\"2026-08\", compare_to=\"2026-08\".");
+  }
+  return parsePeriod(from, to, today);
 }
 
 export function addDays(day: string, n: number): string {
@@ -97,15 +116,17 @@ export type KindFilter = "expense" | "income" | "all";
 
 const norm = (s: string | null | undefined) => (s ?? "").trim().toLowerCase();
 
+/** Matched on slug, the same value a row is labelled with, so a row whose
+ *  category was deleted reads and filters as Uncategorized alike. */
 function resolveCategory(ledger: Ledger, wanted: string): Set<string> {
   const w = norm(wanted);
-  const ids = ledger.categories.filter((c) => norm(c.slug) === w || norm(c.name) === w).map((c) => c.id);
-  if (w === "uncategorized") ids.push("");
-  if (ids.length === 0) {
+  const slugs = ledger.categories.filter((c) => norm(c.slug) === w || norm(c.name) === w).map((c) => c.slug);
+  if (w === UNCATEGORIZED.slug) slugs.push(UNCATEGORIZED.slug);
+  if (slugs.length === 0) {
     const known = [...new Set(ledger.categories.map((c) => c.name))].sort().join(", ");
     throw new ToolInputError(`No category "${wanted}". Known categories: ${known}.`);
   }
-  return new Set(ids);
+  return new Set(slugs);
 }
 
 function resolveGroup(ledger: Ledger, wanted: string): Set<string> {
@@ -118,16 +139,20 @@ function resolveGroup(ledger: Ledger, wanted: string): Set<string> {
   return new Set(ids);
 }
 
+/** Net for rows that count, the face amount for the rest (a duplicate or a
+ *  transfer has no net). Filters, sorting and output all use this. */
+const shownAmount = (t: LedgerTxn) => (t.status === "counted" ? t.net : t.amount);
+
 export function matcher(ledger: Ledger, filter: TxnFilter): (t: LedgerTxn) => boolean {
   const cats = filter.category ? resolveCategory(ledger, filter.category) : null;
   const groups = filter.group ? resolveGroup(ledger, filter.group) : null;
   const words = norm(filter.text).split(/\s+/).filter(Boolean);
   const account = norm(filter.account);
   return (t) => {
-    if (cats && !cats.has(t.category_id ?? "")) return false;
+    if (cats && !cats.has(t.category_slug)) return false;
     if (groups && !(t.group_id && groups.has(t.group_id))) return false;
     if (account && !norm(t.account).includes(account)) return false;
-    const amount = t.status === "counted" ? t.net : t.amount;
+    const amount = shownAmount(t);
     if (filter.min_amount !== undefined && amount < filter.min_amount) return false;
     if (filter.max_amount !== undefined && amount > filter.max_amount) return false;
     if (words.length) {
@@ -140,7 +165,7 @@ export function matcher(ledger: Ledger, filter: TxnFilter): (t: LedgerTxn) => bo
 
 const inPeriod = (p: Period) => (t: LedgerTxn) => t.day >= p.from && t.day <= p.to;
 const countedAs = (kind: KindFilter) => (t: LedgerTxn) =>
-  t.status === "counted" && (kind === "all" ? t.kind !== "other" : t.kind === kind);
+  t.status === "counted" && (kind === "all" || t.kind === kind);
 
 function notIncluded(txns: LedgerTxn[]) {
   const out = { duplicates: 0, fully_refunded: 0, transfers_and_uncounted: 0 };
@@ -157,6 +182,7 @@ function notIncluded(txns: LedgerTxn[]) {
 export type GroupBy = "category" | "group" | "merchant" | "account" | "month" | "week" | "day" | "none";
 const TIME_GROUPINGS: GroupBy[] = ["month", "week", "day"];
 const MAX_DAY_ROWS = 120;
+const MAX_WEEK_ROWS = 530;
 
 interface Bucket {
   key: string;
@@ -225,7 +251,10 @@ export function spendSummary(ledger: Ledger, args: SpendSummaryArgs) {
   }
   const spanDays = (Date.parse(period.to) - Date.parse(period.from)) / 86_400_000 + 1;
   if (group_by === "day" && spanDays > MAX_DAY_ROWS) {
-    throw new ToolInputError(`group_by="day" is limited to about ${MAX_DAY_ROWS} days. Use week or month for longer ranges.`);
+    throw new ToolInputError(`group_by="day" is limited to ${MAX_DAY_ROWS} days. Use week or month for longer ranges.`);
+  }
+  if (group_by === "week" && spanDays / 7 > MAX_WEEK_ROWS) {
+    throw new ToolInputError(`group_by="week" is limited to about ten years. Use month for longer ranges.`);
   }
 
   const matches = matcher(ledger, filter);
@@ -315,7 +344,7 @@ export function txnOut(t: LedgerTxn) {
     day: t.day,
     merchant: t.merchant,
     note: t.note,
-    amount: t.status === "counted" ? t.net : t.amount,
+    amount: shownAmount(t),
     kind: t.kind,
     category: t.category,
   };
@@ -347,12 +376,11 @@ export function searchTransactions(ledger: Ledger, args: SearchArgs) {
   const all = ledger.txns.filter((t) => inPeriod(args.period)(t) && matches(t) && kindOk(t));
   const shown = args.include_uncounted ? all : all.filter((t) => t.status === "counted");
 
-  const amount = (t: LedgerTxn) => (t.status === "counted" ? t.net : t.amount);
   const cmp: Record<SortOrder, (a: LedgerTxn, b: LedgerTxn) => number> = {
     date_desc: (a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0),
     date_asc: (a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0),
-    amount_desc: (a, b) => amount(b) - amount(a),
-    amount_asc: (a, b) => amount(a) - amount(b),
+    amount_desc: (a, b) => shownAmount(b) - shownAmount(a),
+    amount_asc: (a, b) => shownAmount(a) - shownAmount(b),
   };
   const sorted = [...shown].sort(cmp[args.sort]);
   const counted = all.filter((t) => t.status === "counted");
@@ -388,7 +416,6 @@ export interface StoredMonthSummary {
     | { name: string; total: number; one_liner: string | null; groups: StoredGroup[] }[]
     | null;
   generated_at: string | null;
-  model: string | null;
 }
 
 const groupOut = (g: StoredGroup) => ({
@@ -429,9 +456,15 @@ export function monthReview(
       ...(stored.spend_slices ?? []).flatMap((s) => [s, ...(s.parts ?? [])]),
       ...(stored.category_breakdowns ?? []).flatMap((b) => b.groups ?? []),
     ];
-    const hit = candidates.find((g) => norm(g.label) === want && g.txn_ids?.length);
+    const expandable = candidates.filter((g) => g.txn_ids?.length);
+    const hit = expandable.find((g) => norm(g.label) === want);
     if (!hit) {
-      const labels = [...new Set(candidates.map((g) => g.label))].sort().join(", ");
+      if (candidates.some((g) => norm(g.label) === want)) {
+        throw new ToolInputError(
+          `"${expand}" in ${month} was stored without its transactions. Use search_transactions for that month instead.`,
+        );
+      }
+      const labels = [...new Set(expandable.map((g) => g.label))].sort().join(", ");
       throw new ToolInputError(`No slice or group labelled "${expand}" in ${month}. Labels: ${labels}.`);
     }
     expanded = {
@@ -472,6 +505,14 @@ export function budgetStatus(ledger: Ledger, budgets: BudgetDef[], month: string
   let excluded = 0;
   let unbudgeted = 0;
 
+  const [y, m] = month.split("-").map(Number);
+  const monthEnd = endOf(month);
+  const weekStarts: string[] = [];
+  for (let w = weekStart(`${month}-01`); w <= monthEnd; w = addDays(w, 7)) weekStarts.push(w);
+  const isCurrent = today.slice(0, 7) === month;
+  const thisWeek = weekStart(today);
+  const reportedWeeks = new Set([...weekStarts, thisWeek]);
+
   for (const t of ledger.txns) {
     if (t.status !== "counted" || t.kind !== "expense") continue;
     if (t.budget_excluded) {
@@ -487,18 +528,14 @@ export function budgetStatus(ledger: Ledger, budgets: BudgetDef[], month: string
     months.set(t.month, round2((months.get(t.month) ?? 0) + t.net));
     byBudgetMonth.set(id, months);
 
-    const weeks = byBudgetWeek.get(id) ?? new Map<string, LedgerTxn[]>();
     const w = weekStart(t.day);
-    weeks.set(w, [...(weeks.get(w) ?? []), t]);
-    byBudgetWeek.set(id, weeks);
+    if (!reportedWeeks.has(w)) continue;
+    let weeks = byBudgetWeek.get(id);
+    if (!weeks) byBudgetWeek.set(id, (weeks = new Map()));
+    let bucket = weeks.get(w);
+    if (!bucket) weeks.set(w, (bucket = []));
+    bucket.push(t);
   }
-
-  const [y, m] = month.split("-").map(Number);
-  const monthEnd = `${month}-${String(daysInMonth(y, m)).padStart(2, "0")}`;
-  const weekStarts: string[] = [];
-  for (let w = weekStart(`${month}-01`); w <= monthEnd; w = addDays(w, 7)) weekStarts.push(w);
-  const isCurrent = today.slice(0, 7) === month;
-  const thisWeek = weekStart(today);
 
   const catName = new Map(ledger.categories.map((c) => [c.id, c.name]));
   const groupName = new Map(ledger.groups.map((g) => [g.id, g.name]));
@@ -556,7 +593,6 @@ export function budgetStatus(ledger: Ledger, budgets: BudgetDef[], month: string
 
 // ── list_subscriptions ────────────────────────────────────────────────────────
 
-export type Cadence = "weekly" | "monthly" | "quarterly" | "annual" | "irregular";
 
 export interface SubscriptionRow {
   id: string;
@@ -568,14 +604,6 @@ export interface SubscriptionRow {
   amount_max: number | null;
   last_amount: number | null;
   predicted_next: string | null;
-  source: string;
-}
-
-export interface SubscriptionLink {
-  subscription_id: string;
-  transaction_id: string;
-  amount: number;
-  kind: string;
 }
 
 /** Same normalisation as the app's subscriptionMonthly(). */
@@ -585,19 +613,23 @@ export function monthlyCost(median: number | null, cadence: Cadence | null): num
   return Math.round(median * perMonth[cadence ?? "irregular"]);
 }
 
+type LedgerLink = Ledger["subscriptionLinks"][number];
+
 export function subscriptions(
   ledger: Ledger,
   subs: SubscriptionRow[],
-  links: SubscriptionLink[],
   today: string,
   opts: { status?: string; label?: string },
 ) {
   const yearAgo = addDays(today, -365);
-  const linksBySub = new Map<string, SubscriptionLink[]>();
-  for (const l of links) linksBySub.set(l.subscription_id, [...(linksBySub.get(l.subscription_id) ?? []), l]);
+  const linksBySub = new Map<string, LedgerLink[]>();
+  for (const l of ledger.subscriptionLinks) {
+    let list = linksBySub.get(l.subscription_id);
+    if (!list) linksBySub.set(l.subscription_id, (list = []));
+    list.push(l);
+  }
 
   let list = subs;
-  if (opts.status) list = list.filter((s) => s.status === opts.status);
   if (opts.label) {
     const w = norm(opts.label);
     list = list.filter((s) => norm(s.label).includes(w));
@@ -605,12 +637,14 @@ export function subscriptions(
       throw new ToolInputError(`No subscription matching "${opts.label}". Known: ${subs.map((s) => s.label).join(", ")}.`);
     }
   }
+  if (opts.status) list = list.filter((s) => s.status === opts.status);
 
   const rows = list.map((s) => {
+    // A duplicate or fully refunded charge was never really paid.
     const charges = (linksBySub.get(s.id) ?? [])
       .filter((l) => l.kind === "charge")
       .map((l) => ({ link: l, txn: ledger.byId.get(l.transaction_id) }))
-      .filter((c): c is { link: SubscriptionLink; txn: LedgerTxn } => !!c.txn)
+      .filter((c): c is { link: LedgerLink; txn: LedgerTxn } => !!c.txn && c.txn.status === "counted")
       .sort((a, b) => (a.txn.day < b.txn.day ? 1 : -1));
     const contributions = (linksBySub.get(s.id) ?? []).filter((l) => l.kind === "contribution");
     return {
@@ -625,17 +659,17 @@ export function subscriptions(
       next_expected: s.predicted_next,
       charges: charges.length,
       paid_last_12_months: round2(
-        charges.filter((c) => c.txn.day >= yearAgo).reduce((acc, c) => acc + Number(c.link.amount), 0),
+        charges.filter((c) => c.txn.day >= yearAgo).reduce((acc, c) => acc + c.link.amount, 0),
       ),
       ...(contributions.length
-        ? { others_paid_back: round2(contributions.reduce((acc, l) => acc + Number(l.amount), 0)) }
+        ? { others_paid_back: round2(contributions.reduce((acc, l) => acc + l.amount, 0)) }
         : {}),
       ...(opts.label
         ? {
             history: charges.map((c) => ({
               day: c.txn.day,
-              amount: Number(c.link.amount),
-              ...(Number(c.link.amount) !== c.txn.amount ? { whole_charge: c.txn.amount } : {}),
+              amount: c.link.amount,
+              ...(c.link.amount !== c.txn.amount ? { whole_charge: c.txn.amount } : {}),
               merchant: c.txn.merchant,
               note: c.txn.note,
             })),
@@ -645,23 +679,25 @@ export function subscriptions(
   });
 
   return {
-    active_monthly_total: rows.filter((r) => r.status === "active").reduce((s, r) => s + r.monthly_cost, 0),
+    all_active_monthly_total: subs
+      .filter((s) => s.status === "active")
+      .reduce((acc, s) => acc + monthlyCost(s.median_amount, s.cadence), 0),
     subscriptions: rows,
   };
 }
 
 // ── list_debts ────────────────────────────────────────────────────────────────
 
-/** Mirrors the Debt page: loans are rows the user marked lent; whatever is
- *  linked back to a loan as a refund is what has been repaid. */
+/** Mirrors DebtPage.tsx exactly, including its grouping key (lowercased,
+ *  untrimmed) and not skipping duplicates, so chat and the page agree. */
 export function debts(ledger: Ledger, counterparty?: string) {
   const groups = new Map<
     string,
     { name: string; lent: number; repaid: number; outstanding: number; loans: Record<string, unknown>[] }
   >();
   for (const t of ledger.txns) {
-    if (t.lending?.type !== "lent" || t.status === "duplicate") continue;
-    const key = norm(t.lending.counterparty);
+    if (t.lending?.type !== "lent") continue;
+    const key = t.lending.counterparty.toLowerCase();
     if (counterparty && !key.includes(norm(counterparty))) continue;
     const repaid = round2(ledger.refundTotals.get(t.id) ?? 0);
     const outstanding = round2(Math.max(t.amount - repaid, 0));
