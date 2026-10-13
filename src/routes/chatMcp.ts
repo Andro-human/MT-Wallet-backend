@@ -187,10 +187,10 @@ function buildServer(userId: string): McpServer {
     (args) =>
       run(async () => {
         const today = todayIst();
-        const period = parsePeriod(args.from, args.to, today);
-        const compare =
-          parseCompare(args.compare_from, args.compare_to, today);
-        return spendSummary(await getLedger(), {
+        const l = await getLedger();
+        const period = parsePeriod(args.from, args.to, today, l.txns[0]?.day);
+        const compare = parseCompare(args.compare_from, args.compare_to, today);
+        return spendSummary(l, {
           period,
           compare,
           group_by: args.group_by,
@@ -223,16 +223,17 @@ function buildServer(userId: string): McpServer {
       annotations: READ_ONLY,
     },
     (args) =>
-      run(async () =>
-        searchTransactions(await getLedger(), {
-          period: parsePeriod(args.from, args.to, todayIst()),
+      run(async () => {
+        const l = await getLedger();
+        return searchTransactions(l, {
+          period: parsePeriod(args.from, args.to, todayIst(), l.txns[0]?.day),
           filter: args,
           kind: args.kind,
           include_uncounted: args.include_uncounted,
           sort: args.sort,
           limit: args.limit,
-        }),
-      ),
+        });
+      }),
   );
 
   server.registerTool(

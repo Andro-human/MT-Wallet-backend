@@ -84,8 +84,16 @@ test("parsePeriod: from alone runs to today, so 'since November' is one call", (
   assert.deepEqual(parsePeriod("2026", undefined, "2026-10-13"), { from: "2026-01-01", to: "2026-10-13" });
 });
 
-test("parsePeriod: to alone runs from the start of the data to the end of its span", () => {
-  assert.deepEqual(parsePeriod(undefined, "2026-03", "2026-10-13"), { from: "2000-01-01", to: "2026-03-31" });
+test("parsePeriod: to alone runs from the first transaction to the end of its span", () => {
+  assert.deepEqual(parsePeriod(undefined, "2026-03", "2026-10-13", "2025-02-02"), { from: "2025-02-02", to: "2026-03-31" });
+  assert.deepEqual(parsePeriod(undefined, "2024-03", "2026-10-13", "2025-02-02"), { from: "2024-03-01", to: "2024-03-31" });
+  assert.deepEqual(parsePeriod(undefined, "2026-03", "2026-10-13"), { from: "2026-03-01", to: "2026-03-31" });
+});
+
+test("spend_summary: an up-to period by month starts at the data, not decades of empty rows", () => {
+  const ledger = ledgerOf([txn("a", "2026-01-05", 100), txn("b", "2026-03-05", 200)]);
+  const period = parsePeriod(undefined, "2026-03", "2026-10-13", ledger.txns[0].day);
+  assert.deepEqual(summary(ledger, { period, group_by: "month" }).rows.map((r) => r.label), ["2026-01", "2026-02", "2026-03"]);
 });
 
 test("parsePeriod: both bounds cover their whole spans, including leap February", () => {
@@ -133,8 +141,8 @@ test("ledger: refunds net, duplicates and transfers drop out, income allocations
     ],
     {
       refundLinks: [
-        { original_transaction_id: "a", refund_transaction_id: "refund", linked_amount: 300 },
-        { original_transaction_id: "full", refund_transaction_id: "refund2", linked_amount: 500 },
+        { id: "rl1", original_transaction_id: "a", refund_transaction_id: "refund", linked_amount: 300 },
+        { id: "rl2", original_transaction_id: "full", refund_transaction_id: "refund2", linked_amount: 500 },
       ],
       duplicateIds: ["dup"],
     },
@@ -161,10 +169,16 @@ test("ledger: direction decides which flag counts, so a credit carrying both fla
   assert.equal(summary(ledger, { kind: "income" }).total, 50000);
 });
 
-test("ledger: a row returned twice by paging is counted once", () => {
-  const ledger = ledgerOf([txn("a", "2026-09-01", 100), txn("a", "2026-09-01", 100)]);
+test("ledger: rows returned twice by paging count once, links included", () => {
+  const link = { id: "rl-dup", original_transaction_id: "a", refund_transaction_id: "r", linked_amount: 30 };
+  const charge = { subscription_id: "s", transaction_id: "a", amount: 100, kind: "charge", label: "S" };
+  const ledger = ledgerOf([txn("a", "2026-09-01", 100), txn("a", "2026-09-01", 100)], {
+    refundLinks: [link, link],
+    subscriptionLinks: [charge, charge],
+  });
   assert.equal(ledger.txns.length, 1);
-  assert.equal(summary(ledger).total, 100);
+  assert.equal(summary(ledger).total, 70);
+  assert.equal(ledger.subscriptionLinks.length, 1);
 });
 
 test("ledger: the day is the IST day, not the UTC one", () => {
@@ -176,10 +190,10 @@ test("ledger: the day is the IST day, not the UTC one", () => {
 test("ledger: partial income allocation, ignored zero links and summed refunds", () => {
   const ledger = ledgerOf([txn("order", "2026-09-01", 1000), credit("back", "2026-09-02", 1000)], {
     refundLinks: [
-      { original_transaction_id: "order", refund_transaction_id: "back", linked_amount: 200 },
-      { original_transaction_id: "order", refund_transaction_id: "back", linked_amount: "100" },
-      { original_transaction_id: "order", refund_transaction_id: "back", linked_amount: null },
-      { original_transaction_id: "order", refund_transaction_id: "back", linked_amount: 0 },
+      { id: "rl3", original_transaction_id: "order", refund_transaction_id: "back", linked_amount: 200 },
+      { id: "rl4", original_transaction_id: "order", refund_transaction_id: "back", linked_amount: "100" },
+      { id: "rl5", original_transaction_id: "order", refund_transaction_id: "back", linked_amount: null },
+      { id: "rl6", original_transaction_id: "order", refund_transaction_id: "back", linked_amount: 0 },
     ],
   });
   assert.equal(ledger.byId.get("order")!.net, 700);
@@ -378,7 +392,7 @@ test("search_transactions: amount filters use the face amount for rows that don'
 
 test("search_transactions: income kind and a partly refunded row's gross", () => {
   const ledger = ledgerOf([txn("o", "2026-09-01", 1000), credit("r", "2026-09-02", 400, { is_income: false }), credit("s", "2026-09-03", 9000)], {
-    refundLinks: [{ original_transaction_id: "o", refund_transaction_id: "r", linked_amount: 400 }],
+    refundLinks: [{ id: "rl7", original_transaction_id: "o", refund_transaction_id: "r", linked_amount: 400 }],
   });
   const income = search(ledger, { kind: "income" });
   assert.equal(income.income_total, 9000);
@@ -619,8 +633,8 @@ test("list_debts: repaid is what was linked back; over-repayment clamps; largest
         { transaction_id: "back", lending: { type: "repayment", counterparty: "Muskan" }, budget_excluded: false, service_identity: null },
       ],
       refundLinks: [
-        { original_transaction_id: "l1", refund_transaction_id: "back", linked_amount: 400 },
-        { original_transaction_id: "l3", refund_transaction_id: "over", linked_amount: 900 },
+        { id: "rl8", original_transaction_id: "l1", refund_transaction_id: "back", linked_amount: 400 },
+        { id: "rl9", original_transaction_id: "l3", refund_transaction_id: "over", linked_amount: 900 },
       ],
     },
   );

@@ -66,7 +66,12 @@ export interface SubscriptionLinkRow {
 
 export interface LedgerInputs {
   txns: RawTxn[];
-  refundLinks: { original_transaction_id: string; refund_transaction_id: string; linked_amount: number | string | null }[];
+  refundLinks: {
+    id: string;
+    original_transaction_id: string;
+    refund_transaction_id: string;
+    linked_amount: number | string | null;
+  }[];
   duplicateIds: string[];
   combines: { combine_id: string; transaction_id: string }[];
   categories: { id: string; name: string; slug: string }[];
@@ -96,9 +101,16 @@ export interface Ledger {
  *  both is_expense and is_income, so reading the flags alone would book a
  *  salary credit as spend. */
 export function resolveLedger(input: LedgerInputs): Ledger {
+  // Offset paging can return a row twice when an insert lands mid-load, and
+  // every list below is summed.
+  const refundLinks = new Map(input.refundLinks.map((l) => [l.id, l])).values();
+  const subscriptionLinks = [
+    ...new Map(input.subscriptionLinks.map((l) => [`${l.subscription_id}:${l.transaction_id}`, l])).values(),
+  ];
+
   const refundTotals = new Map<string, number>();
   const refundAllocations = new Map<string, number>();
-  for (const l of input.refundLinks) {
+  for (const l of refundLinks) {
     const amt = Number(l.linked_amount ?? 0);
     if (!amt) continue;
     refundTotals.set(l.original_transaction_id, (refundTotals.get(l.original_transaction_id) ?? 0) + amt);
@@ -110,7 +122,7 @@ export function resolveLedger(input: LedgerInputs): Ledger {
   const groupById = new Map(input.groups.map((g) => [g.id, g]));
   const enrichById = new Map(input.enrichment.map((e) => [e.transaction_id, e]));
   const subByTxn = new Map<string, string>();
-  for (const s of input.subscriptionLinks) if (s.kind === "charge") subByTxn.set(s.transaction_id, s.label);
+  for (const s of subscriptionLinks) if (s.kind === "charge") subByTxn.set(s.transaction_id, s.label);
 
   const combineTag = new Map<string, string>();
   const tagByCombine = new Map<string, string>();
@@ -123,7 +135,6 @@ export function resolveLedger(input: LedgerInputs): Ledger {
     combineTag.set(r.transaction_id, tag);
   }
 
-  // Offset paging can return a row twice when an insert lands mid-load.
   const unique = new Map(input.txns.map((t) => [t.id, t]));
 
   const txns: LedgerTxn[] = [...unique.values()].map((t) => {
@@ -179,7 +190,7 @@ export function resolveLedger(input: LedgerInputs): Ledger {
     refundTotals,
     categories: input.categories,
     groups: input.groups,
-    subscriptionLinks: input.subscriptionLinks.map(({ label: _label, ...link }) => link),
+    subscriptionLinks: subscriptionLinks.map(({ label: _label, ...link }) => link),
   };
 }
 
@@ -196,7 +207,7 @@ export async function loadLedger(userId: string): Promise<Ledger> {
       ),
       fetchAll<LedgerInputs["refundLinks"][number]>(
         "refund_links",
-        "original_transaction_id, refund_transaction_id, linked_amount",
+        "id, original_transaction_id, refund_transaction_id, linked_amount",
         mine,
       ),
       fetchAll<{ duplicate_transaction_id: string }>("duplicate_links", "duplicate_transaction_id", mine),
@@ -263,6 +274,7 @@ const cache = new Map<string, { at: number; ledger: Promise<Ledger> }>();
 export function cachedLedger(userId: string, now = Date.now()): Promise<Ledger> {
   const hit = cache.get(userId);
   if (hit && now - hit.at < LEDGER_TTL_MS) return hit.ledger;
+  for (const [key, entry] of cache) if (now - entry.at >= LEDGER_TTL_MS) cache.delete(key);
   const ledger = loadLedger(userId);
   cache.set(userId, { at: now, ledger });
   ledger.catch(() => {

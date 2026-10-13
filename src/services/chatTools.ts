@@ -24,7 +24,6 @@ export interface Period {
 }
 
 const PERIOD_RE = /^20\d{2}(-(0[1-9]|1[0-2])(-(0[1-9]|[12]\d|3[01]))?)?$/;
-const EARLIEST = "2000-01-01";
 
 function daysInMonth(y: number, m: number): number {
   return new Date(Date.UTC(y, m, 0)).getUTCDate();
@@ -56,13 +55,20 @@ function checkBound(v: string | undefined) {
 }
 
 /** Bounds are YYYY, YYYY-MM or YYYY-MM-DD, each covering its whole span and
- *  inclusive. from alone runs to today ("since"); to alone runs from the start
- *  of the data; neither is the current month to date. */
-export function parsePeriod(from: string | undefined, to: string | undefined, today: string): Period {
+ *  inclusive. from alone runs to today ("since"); to alone runs from the first
+ *  transaction (`dataStart`), not a fixed epoch, so a month or week breakdown
+ *  does not open with decades of empty rows. Neither is the current month to date. */
+export function parsePeriod(
+  from: string | undefined,
+  to: string | undefined,
+  today: string,
+  dataStart?: string,
+): Period {
   checkBound(from);
   checkBound(to);
   if (!from && !to) return { from: startOf(today.slice(0, 7)), to: today };
-  const period = { from: from ? startOf(from) : EARLIEST, to: to ? endOf(to) : today };
+  const upToStart = (to: string) => (dataStart && dataStart < startOf(to) ? dataStart : startOf(to));
+  const period = { from: from ? startOf(from) : upToStart(to!), to: to ? endOf(to) : today };
   if (period.from > period.to) throw new ToolInputError(`from (${period.from}) is after to (${period.to}).`);
   return period;
 }
