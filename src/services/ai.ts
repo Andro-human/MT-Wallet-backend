@@ -3,6 +3,7 @@ import { google } from "@ai-sdk/google";
 import { groq } from "@ai-sdk/groq";
 import { z } from "zod";
 import type { SMSMessage, Category } from "../types/index.js";
+import { emailBodyPreview } from "./emailPreview.js";
 
 // ── Schemas ─────────────────────────────────────────────────────────────────
 
@@ -366,11 +367,6 @@ NO: OTP / verification, statement / balance update, promo / cashback (without an
 
 Output one object per input, same order. Copy sms_id EXACTLY.`;
 
-// First N chars of body fed to email Pass 1 to disambiguate vague subjects.
-// Most banks front-load the "Rs.X spent/debited/credited" line within the first
-// 150-200 chars; longer is mostly noise.
-const EMAIL_BODY_PREVIEW_CHARS = 200;
-
 async function classifyBatch(
   messages: SMSMessage[],
   usage: ModelUsage,
@@ -389,7 +385,7 @@ async function classifyBatch(
         sms_id: m.id,
         subject: m.subject,
         sender: m.sender,
-        body_preview: (m.body || "").slice(0, EMAIL_BODY_PREVIEW_CHARS),
+        body_preview: emailBodyPreview(m.body || ""),
       }))
     : messages.map((m) => ({ sms_id: m.id, body: m.body, sender: m.sender }));
 
