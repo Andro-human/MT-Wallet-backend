@@ -669,3 +669,12 @@ test("get_overview: month totals from counted rows, review flags, usage-ordered 
   assert.deepEqual(r.groups, [{ name: "Goa trip", spent: 300 }]);
   assert.equal(overview(ledgerOf([]), "2026-10-13", [], 0, 0).data_from, null);
 });
+
+test("a cashback credit is never income, even with a stale is_income", () => {
+  const ledger = ledgerOf([
+    credit("pay", "2026-10-01", 50_000),
+    credit("cb", "2026-10-03", 1246, { cashback_month: "2026-09-01" }),
+  ]);
+  assert.equal(ledger.byId.get("cb")!.status, "not_counted");
+  assert.equal(summary(ledger, { kind: "income" }).total, 50_000);
+});

@@ -82,7 +82,10 @@ export interface PayloadDay {
 export interface ReviewPayload {
   month: string;
   timezone: string;
-  totals: { spent: number; income: number };
+  /** spent is gross: the items and slices partition it. cashback is credits
+   *  marked as lowering this month's spending; it lowers the total only, never
+   *  an item. */
+  totals: { spent: number; income: number; cashback: number };
   items: PayloadItem[];
   days: PayloadDay[];
   income_lines: { d: string; merchant: string | null; note: string | null; amount: number }[];
@@ -223,10 +226,11 @@ export async function buildReviewPayloadWithIds(userId: string, month: string): 
     existingDays,
     priorSummaries,
     storedBreakdowns,
+    cashbackRows,
   ] = await Promise.all([
       fetchAll<any>(
         "transactions",
-        "id, amount, merchant, notes, transacted_at, direction, is_expense, is_income, category_id, group_id",
+        "id, amount, merchant, notes, transacted_at, direction, is_expense, is_income, category_id, group_id, cashback_month",
         (q) => q.eq("user_id", userId).gte("transacted_at", windowStart).lte("transacted_at", windowEnd),
       ),
       fetchAll<any>("refund_links", "original_transaction_id, refund_transaction_id, linked_amount", (q) =>
@@ -258,6 +262,10 @@ export async function buildReviewPayloadWithIds(userId: string, month: string): 
           return data ?? [];
         }),
       loadStoredBreakdowns(userId, month),
+      // Usually arrives the month after, so it is rarely inside the txn window.
+      fetchAll<any>("transactions", "id, amount", (q) =>
+        q.eq("user_id", userId).eq("cashback_month", `${month}-01`),
+      ),
     ]);
 
   // Short, stable per-payload tags so the agent can see which rows are one
@@ -311,7 +319,7 @@ export async function buildReviewPayloadWithIds(userId: string, month: string): 
     }
     const amount = Number(t.amount);
 
-    if (t.is_income) {
+    if (t.is_income && !t.cashback_month) {
       const net = round2(Math.max(amount - (refundAllocations[t.id] ?? 0), 0));
       if (net > 0) {
         totalIncome = round2(totalIncome + net);
@@ -394,6 +402,11 @@ export async function buildReviewPayloadWithIds(userId: string, month: string): 
     for (const b of s.category_breakdowns ?? []) for (const g of b.groups ?? []) groupLabels.add(g.label);
   }
 
+  let totalCashback = 0;
+  for (const c of cashbackRows) {
+    if (!duplicateExcludeIds.has(c.id)) totalCashback = round2(totalCashback + Number(c.amount));
+  }
+
   const storedFingerprints = new Map(
     storedBreakdowns.map((b) => [b.category ?? "", b.fingerprint ?? null]),
   );
@@ -401,7 +414,7 @@ export async function buildReviewPayloadWithIds(userId: string, month: string): 
   const payload: ReviewPayload = {
     month,
     timezone: TZ,
-    totals: { spent: totalSpent, income: totalIncome },
+    totals: { spent: totalSpent, income: totalIncome, cashback: totalCashback },
     items: [...itemsByKey.values()]
       .sort((a, b) => b.total - a.total)
       .map((item) => {
@@ -920,6 +933,7 @@ export async function storeReview(
     month: payload.month,
     total_spent: Math.round(payload.totals.spent),
     total_income: Math.round(payload.totals.income),
+    cashback: Math.round(payload.totals.cashback),
     allocations: payload.items
       .slice(0, 10)
       .map((i) => ({ name: i.name, amount: Math.round(i.total), type: i.kind })),

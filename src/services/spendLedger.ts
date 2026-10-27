@@ -51,6 +51,9 @@ export interface RawTxn {
   direction: string | null;
   is_expense: boolean | null;
   is_income: boolean | null;
+  /** Set on a cashback credit, which is never income: it lowers a month's
+   *  total spend. Wins over a stale is_income. */
+  cashback_month?: string | null;
   category_id: string | null;
   group_id: string | null;
   bank_name: string | null;
@@ -147,7 +150,7 @@ export function resolveLedger(input: LedgerInputs): Ledger {
 
     if (duplicates.has(t.id)) {
       status = "duplicate";
-    } else if (!(isDebit ? t.is_expense : t.is_income)) {
+    } else if (!(isDebit ? t.is_expense : t.is_income && !t.cashback_month)) {
       status = "not_counted";
     } else {
       refunded = round2((isDebit ? refundTotals : refundAllocations).get(t.id) ?? 0);
@@ -202,7 +205,7 @@ export async function loadLedger(userId: string): Promise<Ledger> {
     await Promise.all([
       fetchAll<RawTxn>(
         "transactions",
-        "id, amount, merchant, notes, transacted_at, direction, is_expense, is_income, category_id, group_id, bank_name, account_last4",
+        "id, amount, merchant, notes, transacted_at, direction, is_expense, is_income, category_id, group_id, bank_name, account_last4, cashback_month",
         mine,
       ),
       fetchAll<LedgerInputs["refundLinks"][number]>(
