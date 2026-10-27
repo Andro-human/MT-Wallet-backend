@@ -18,7 +18,7 @@ const payload = (
   ({
     month: "2026-07",
     timezone: "Asia/Kolkata",
-    totals: { spent: 0, income: 0 },
+    totals: { spent: 0, income: 0, cashback: 0 },
     items: items.map((i, n) => ({
       key: `cat:${n}`,
       kind: "category",

@@ -113,7 +113,7 @@ function makePayload(over: { needsRegen?: boolean } = {}): ReviewPayload {
   return {
     month: "2026-07",
     timezone: "Asia/Kolkata",
-    totals: { spent: 200, income: 0 },
+    totals: { spent: 200, income: 0, cashback: 0 },
     items: [
       {
         key: "cat:a",
@@ -198,7 +198,7 @@ test("slices reconcile across ALL items and must sum to total spent", () => {
 });
 
 test("zero-expense month: empty items reconcile cleanly", () => {
-  const empty: ReviewPayload = { ...makePayload(), totals: { spent: 0, income: 500 }, items: [] };
+  const empty: ReviewPayload = { ...makePayload(), totals: { spent: 0, income: 500, cashback: 0 }, items: [] };
   const r = reconcile(empty, submit({ items: [] }));
   assert.deepEqual(r.errors, []);
   assert.deepEqual(r.breakdowns, []);
@@ -295,7 +295,7 @@ test("submitting an item that did not need regenerating is still accepted", () =
 const dayPayload = (over: Partial<ReviewPayload["days"][number]> = {}): ReviewPayload => ({
   month: "2026-08",
   timezone: "Asia/Kolkata",
-  totals: { spent: 300, income: 0 },
+  totals: { spent: 300, income: 0, cashback: 0 },
   items: [],
   days: [
     {
@@ -470,7 +470,7 @@ test("a highlight restating the month's spend is refused", () => {
 });
 
 test("a highlight restating income is refused too", () => {
-  const payload = { ...makePayload(), totals: { spent: 200, income: 500 } };
+  const payload = { ...makePayload(), totals: { spent: 200, income: 500, cashback: 0 } };
   const r = reconcileSubmission(
     payload,
     submit({ review: { highlights: ["Income was \u20b9500.", "Something real."] } }),
