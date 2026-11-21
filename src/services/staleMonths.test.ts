@@ -32,7 +32,6 @@ const payload = (
     days: days.map((d, n) => ({
       day: `2026-07-0${n + 1}`,
       total: 100,
-      all_noted: true,
       notes_fingerprint: `d${n}`,
       has_summary: false,
       summary_stale: false,

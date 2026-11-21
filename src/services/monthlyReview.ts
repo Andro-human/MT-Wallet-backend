@@ -60,17 +60,16 @@ export interface PayloadItem {
 export interface PayloadDay {
   day: string;
   total: number;
-  /** Every counted expense that day carries a note. A summary written from a
-   *  partly-noted day describes the noted half and misrepresents the rest. */
-  all_noted: boolean;
-  /** Digest of the day's notes. Changes when a note is edited, which is the
-   *  signal to rewrite a day already summarised. Keyed on transaction id, not
-   *  ordinal, so inserting an earlier transaction does not invalidate it. */
+  /** Digest of every input the day's summary reads: membership, net amount,
+   *  merchant, combine tag and note. Any edit to one of them is the signal to
+   *  rewrite a day already summarised. Keyed on transaction id, not ordinal, so
+   *  inserting a transaction on another day does not invalidate it. The name
+   *  predates amounts and merchants being in it; the column shares it. */
   notes_fingerprint: string;
   /** A summary already exists for this day. */
   has_summary: boolean;
-  /** Stored summary was written against different notes: a note was edited, a
-   *  transaction arrived, or a refund changed the day's total. */
+  /** Stored summary was written against a different day: a note, amount or
+   *  merchant was edited, a transaction arrived or left, or a refund changed it. */
   summary_stale: boolean;
   /** Hand-authored. Never overwrite; storeReview refuses these anyway. */
   summary_locked: boolean;
@@ -117,6 +116,18 @@ export async function fetchAll<T>(
 const digest = (keys: string[]) =>
   createHash("sha256").update([...keys].sort().join("\u0000")).digest("hex").slice(0, 16);
 
+export interface DayRow {
+  id: string;
+  net: number;
+  merchant: string | null;
+  combine?: string;
+  note: string;
+}
+
+/** Covers exactly what a day's summary reads, so editing any of it reopens the day. */
+export const dayFingerprint = (rows: DayRow[]) =>
+  digest(rows.map((r) => `${r.id}:${r.net}:${r.merchant ?? ""}:${r.combine ?? ""}:${r.note}`));
+
 /** Identity of a breakdown across regenerations: the group key for grouped
  *  spend, the category slug otherwise. Matches what storeReview writes as
  *  `category`, which is how a stored breakdown finds its payload item again. */
@@ -147,28 +158,11 @@ export interface DaySummaryStatus {
 }
 
 /** Whether the agent should write this day. Backfill and staleness live here so
- *  the agent never reasons about fingerprints: a day is written when it is fully
- *  noted, not hand-authored, and either has no summary yet or was summarised
- *  against different notes. That second case is what lets a late refund or an
- *  edited note reopen a day that was already done. */
-/** Whether a transaction counts as noted for the purposes of writing a day.
- *
- *  A combined purchase carries its note on one row: the food order has it, the
- *  delivery fee billed seconds later does not. Judging each row alone marked the
- *  fee unnoted and blocked the whole day, which is why 26 Aug never got a
- *  summary despite the only real purchase being described.
- */
-export function isEffectivelyNoted(
-  note: string,
-  combineTag: string | undefined,
-  notedCombineTags: Set<string>,
-): boolean {
-  if (note) return true;
-  return !!combineTag && notedCombineTags.has(combineTag);
-}
-
+ *  the agent never reasons about fingerprints: a day is written when it is not
+ *  hand-authored and either has no summary yet or was summarised against a
+ *  different day. Notes are not required: small purchases go un-noted, and
+ *  requiring them left whole days without a line. */
 export function daySummaryStatus(
-  allNoted: boolean,
   fingerprint: string,
   stored: StoredDay | undefined,
 ): DaySummaryStatus {
@@ -179,7 +173,7 @@ export function daySummaryStatus(
     has_summary,
     summary_stale,
     summary_locked,
-    needs_summary: allNoted && !summary_locked && (!has_summary || summary_stale),
+    needs_summary: !summary_locked && (!has_summary || summary_stale),
   };
 }
 
@@ -283,12 +277,6 @@ export async function buildReviewPayloadWithIds(userId: string, month: string): 
     }
   }
 
-  const notedCombineTags = new Set<string>();
-  for (const t of txnsRaw as any[]) {
-    const tag = combineTag.get(t.id);
-    if (tag && (t.notes ?? "").trim()) notedCombineTags.add(tag);
-  }
-
   const refundTotals: Record<string, number> = {};
   const refundAllocations: Record<string, number> = {};
   for (const l of refundLinks) {
@@ -303,7 +291,7 @@ export async function buildReviewPayloadWithIds(userId: string, month: string): 
 
   const itemsByKey = new Map<string, Omit<PayloadItem, "fingerprint" | "needs_regen">>();
   const itemKeys = new Map<string, string[]>();
-  const dayAcc = new Map<string, { total: number; txns: PayloadTxn[]; noteKeys: string[]; allNoted: boolean }>();
+  const dayAcc = new Map<string, { total: number; txns: PayloadTxn[]; rows: DayRow[] }>();
   const incomeLines: ReviewPayload["income_lines"] = [];
   const excluded = { duplicates: 0, fullyRefunded: 0, notCounted: 0 };
   let totalSpent = 0;
@@ -374,7 +362,7 @@ export async function buildReviewPayloadWithIds(userId: string, month: string): 
     itemKeys.set(key, keys);
 
     const dayKey = istDay(t.transacted_at);
-    const day = dayAcc.get(dayKey) ?? { total: 0, txns: [], noteKeys: [], allNoted: true };
+    const day = dayAcc.get(dayKey) ?? { total: 0, txns: [], rows: [] };
     day.total = round2(day.total + net);
     day.txns.push({
       n,
@@ -384,10 +372,7 @@ export async function buildReviewPayloadWithIds(userId: string, month: string): 
       amount: net,
       ...(combineTag.has(t.id) ? { c: combineTag.get(t.id)! } : {}),
     });
-    day.noteKeys.push(`${t.id}:${note}`);
-    if (!isEffectivelyNoted(note, combineTag.get(t.id), notedCombineTags)) {
-      day.allNoted = false;
-    }
+    day.rows.push({ id: t.id, net, merchant: t.merchant ?? null, combine: combineTag.get(t.id), note });
     dayAcc.set(dayKey, day);
   }
 
@@ -428,13 +413,12 @@ export async function buildReviewPayloadWithIds(userId: string, month: string): 
     days: [...dayAcc.entries()]
       .sort((a, b) => (a[0] < b[0] ? 1 : -1))
       .map(([day, d]) => {
-        const fingerprint = digest(d.noteKeys);
+        const fingerprint = dayFingerprint(d.rows);
         return {
           day,
           total: d.total,
-          all_noted: d.allNoted,
           notes_fingerprint: fingerprint,
-          ...daySummaryStatus(d.allNoted, fingerprint, storedDays.get(day)),
+          ...daySummaryStatus(fingerprint, storedDays.get(day)),
           txns: d.txns,
         };
       }),
@@ -715,10 +699,6 @@ export function reconcileDays(
     const day = byDay.get(sub.day);
     if (!day) {
       pushError(errors, `day ${sub.day}: not in this month's payload`);
-      continue;
-    }
-    if (!day.all_noted) {
-      pushError(errors, `day ${sub.day}: not every transaction is noted, so it must be left without a summary`);
       continue;
     }
     const byN = new Map(day.txns.map((t) => [t.n, t.amount]));
