@@ -5,8 +5,8 @@ import {
   reconcileSubmission,
   reconcileDays,
   daySummaryStatus,
+  dayFingerprint,
   ReviewSubmissionSchema,
-  isEffectivelyNoted,
   totalsInHighlights,
   type ReviewPayload,
   type StoredBreakdown,
@@ -301,7 +301,6 @@ const dayPayload = (over: Partial<ReviewPayload["days"][number]> = {}): ReviewPa
     {
       day: "2026-08-20",
       total: 300,
-      all_noted: true,
       notes_fingerprint: "abc123",
       txns: [
         { n: 1, d: "2026-08-20", merchant: "Zomato", note: "lunch", amount: 200 },
@@ -356,11 +355,13 @@ test("day: accepts the day total and a bare transaction amount as figures", () =
   assert.equal(days.length, 1);
 });
 
-test("day: refuses a day that is not fully noted", () => {
+test("day: accepts a day where some transactions have no note", () => {
   const errors: string[] = [];
-  const days = reconcileDays(dayPayload({ all_noted: false }), daySubmission("Food delivery ₹200. Groceries ₹100.") as any, errors);
-  assert.equal(days.length, 0);
-  assert.ok(errors.some((e) => e.includes("noted")), errors.join(" | "));
+  const payload = dayPayload();
+  payload.days[0].txns[1].note = null;
+  const days = reconcileDays(payload, daySubmission("Food delivery ₹200. Zepto ₹100.") as any, errors);
+  assert.deepEqual(errors, []);
+  assert.equal(days.length, 1);
 });
 
 test("day: refuses groups that do not cover the day", () => {
@@ -385,35 +386,26 @@ test("day: refuses an unknown date", () => {
 
 // ─── day summary backfill / staleness ────────────────────────────────────────
 
-test("day status: a fully noted day with no summary is written", () => {
-  const s = daySummaryStatus(true, "abc123", undefined);
+test("day status: a day with no summary is written, noted or not", () => {
+  const s = daySummaryStatus("abc123", undefined);
   assert.equal(s.has_summary, false);
   assert.equal(s.needs_summary, true);
 });
 
-test("day status: a day that is not fully noted is never written", () => {
-  // 26 Aug 2026 sat here: a Rs 17.98 Zomato charge carried no note.
-  assert.equal(daySummaryStatus(false, "abc123", undefined).needs_summary, false);
-  assert.equal(
-    daySummaryStatus(false, "new", { notes_fingerprint: "old", model: "gemini" }).needs_summary,
-    false,
-  );
-});
-
 test("day status: an unchanged day is left alone", () => {
-  const s = daySummaryStatus(true, "abc123", { notes_fingerprint: "abc123", model: "gemini" });
+  const s = daySummaryStatus("abc123", { notes_fingerprint: "abc123", model: "gemini" });
   assert.equal(s.summary_stale, false);
   assert.equal(s.needs_summary, false);
 });
 
 test("day status: a changed note or a late refund reopens the day", () => {
-  const s = daySummaryStatus(true, "NEW", { notes_fingerprint: "OLD", model: "gemini" });
+  const s = daySummaryStatus("NEW", { notes_fingerprint: "OLD", model: "gemini" });
   assert.equal(s.summary_stale, true);
   assert.equal(s.needs_summary, true);
 });
 
 test("day status: hand-written days are never reopened, even when stale", () => {
-  const s = daySummaryStatus(true, "NEW", { notes_fingerprint: "OLD", model: "manual" });
+  const s = daySummaryStatus("NEW", { notes_fingerprint: "OLD", model: "manual" });
   assert.equal(s.summary_locked, true);
   assert.equal(s.summary_stale, true);
   assert.equal(s.needs_summary, false);
@@ -421,23 +413,22 @@ test("day status: hand-written days are never reopened, even when stale", () => 
 
 test("day status: a stored row with a null fingerprint counts as stale", () => {
   // Rows written before the fingerprint column existed.
-  const s = daySummaryStatus(true, "abc123", { notes_fingerprint: null, model: "gemini" });
+  const s = daySummaryStatus("abc123", { notes_fingerprint: null, model: "gemini" });
   assert.equal(s.needs_summary, true);
 });
 
-test("a combined purchase counts as noted from the row that carries the note", () => {
-  // The food order has the note, the delivery fee billed seconds later does not.
-  const noted = new Set(["c1"]);
-  assert.equal(isEffectivelyNoted("chicken thali", "c1", noted), true);
-  assert.equal(isEffectivelyNoted("", "c1", noted), true);
-});
-
-test("an uncombined row with no note still blocks the day", () => {
-  assert.equal(isEffectivelyNoted("", undefined, new Set(["c1"])), false);
-});
-
-test("a combined purchase where nothing carries a note still blocks the day", () => {
-  assert.equal(isEffectivelyNoted("", "c2", new Set(["c1"])), false);
+test("day fingerprint: any input the summary reads reopens the day, order does not", () => {
+  const rows = [
+    { id: "a", net: 200, merchant: "Zomato", note: "lunch" },
+    { id: "b", net: 100, merchant: "Zepto", note: "" },
+  ];
+  const base = dayFingerprint(rows);
+  assert.equal(dayFingerprint([rows[1], rows[0]]), base);
+  assert.notEqual(dayFingerprint([{ ...rows[0], net: 150 }, rows[1]]), base);
+  assert.notEqual(dayFingerprint([rows[0], { ...rows[1], merchant: "Blinkit" }]), base);
+  assert.notEqual(dayFingerprint([rows[0], { ...rows[1], note: "milk" }]), base);
+  assert.notEqual(dayFingerprint([rows[0], { ...rows[1], combine: "c1" }]), base);
+  assert.notEqual(dayFingerprint([rows[0]]), base);
 });
 
 // ─── the ended-month guard ──────────────────────────────────────────────────
