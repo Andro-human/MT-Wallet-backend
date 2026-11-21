@@ -173,6 +173,24 @@ const inPeriod = (p: Period) => (t: LedgerTxn) => t.day >= p.from && t.day <= p.
 const countedAs = (kind: KindFilter) => (t: LedgerTxn) =>
   t.status === "counted" && (kind === "all" || t.kind === kind);
 
+const unfiltered = (f: TxnFilter) => Object.values(f).every((v) => v == null || v === "");
+
+/** A month's cashback counts in a period when the month's 1st is inside it,
+ *  the same rule as the app's month_summary. It lowers total spent only, never
+ *  a category, group, merchant or account. */
+function monthCashback(ledger: Ledger, month: string, p: Period): number {
+  const first = `${month}-01`;
+  return first >= p.from && first <= p.to ? (ledger.cashbackByMonth.get(month) ?? 0) : 0;
+}
+
+function cashbackIn(ledger: Ledger, p: Period): number {
+  let total = 0;
+  for (const month of ledger.cashbackByMonth.keys()) total += monthCashback(ledger, month, p);
+  return round2(total);
+}
+
+const afterCashback = (spent: number, cashback: number) => round2(Math.max(spent - cashback, 0));
+
 function notIncluded(txns: LedgerTxn[]) {
   const out = { duplicates: 0, fully_refunded: 0, transfers_and_uncounted: 0 };
   for (const t of txns) {
@@ -267,7 +285,10 @@ export function spendSummary(ledger: Ledger, args: SpendSummaryArgs) {
   const select = (p: Period) => ledger.txns.filter((t) => inPeriod(p)(t) && matches(t));
   const inRange = select(period);
   const current = inRange.filter(countedAs(kind));
-  const total = round2(current.reduce((s, t) => s + t.net, 0));
+  const gross = round2(current.reduce((s, t) => s + t.net, 0));
+  const netsCashback = kind === "expense" && unfiltered(filter);
+  const cashback = netsCashback ? cashbackIn(ledger, period) : 0;
+  const total = afterCashback(gross, cashback);
   const buckets = bucketize(current, group_by);
 
   if (isTime && group_by !== "day") {
@@ -288,19 +309,26 @@ export function spendSummary(ledger: Ledger, args: SpendSummaryArgs) {
   }
 
   const prevBuckets = compare ? bucketize(select(compare).filter(countedAs(kind)), group_by) : null;
-  const prevTotal = prevBuckets ? round2([...prevBuckets.values()].reduce((s, b) => s + b.total, 0)) : null;
+  const prevTotal = prevBuckets
+    ? afterCashback(
+        [...prevBuckets.values()].reduce((s, b) => s + b.total, 0),
+        netsCashback ? cashbackIn(ledger, compare!) : 0,
+      )
+    : null;
 
   const keys = new Set([...buckets.keys(), ...(prevBuckets?.keys() ?? [])]);
   let rows = [...keys].map((key) => {
     const b = buckets.get(key);
     const p = prevBuckets?.get(key);
-    const amount = b?.total ?? 0;
+    const rowCashback = netsCashback && group_by === "month" ? monthCashback(ledger, key, period) : 0;
+    const amount = afterCashback(b?.total ?? 0, rowCashback);
     const row: Record<string, unknown> = {
       label: b ? topLabel(b) : topLabel(p!),
       total: amount,
+      ...(rowCashback ? { cashback: rowCashback } : {}),
       count: b?.txns.length ?? 0,
       orders: b ? countOrders(b.txns) : 0,
-      share_pct: pct(amount, total),
+      share_pct: pct(amount, group_by === "month" ? total : gross),
     };
     if (prevBuckets) {
       const before = p?.total ?? 0;
@@ -325,6 +353,7 @@ export function spendSummary(ledger: Ledger, args: SpendSummaryArgs) {
     kind,
     group_by,
     total,
+    ...(cashback ? { before_cashback: gross, cashback } : {}),
     count: current.length,
     orders: countOrders(current),
     ...(compare
@@ -390,11 +419,14 @@ export function searchTransactions(ledger: Ledger, args: SearchArgs) {
   };
   const sorted = [...shown].sort(cmp[args.sort]);
   const counted = all.filter((t) => t.status === "counted");
+  const cashback = args.kind !== "income" && unfiltered(args.filter) ? cashbackIn(ledger, args.period) : 0;
+  const grossSpent = counted.filter((t) => t.kind === "expense").reduce((s, t) => s + t.net, 0);
 
   return {
     period: args.period,
     matched: shown.length,
-    spent_total: round2(counted.filter((t) => t.kind === "expense").reduce((s, t) => s + t.net, 0)),
+    spent_total: afterCashback(grossSpent, cashback),
+    ...(cashback ? { cashback } : {}),
     income_total: round2(counted.filter((t) => t.kind === "income").reduce((s, t) => s + t.net, 0)),
     returned: Math.min(sorted.length, args.limit),
     ...(sorted.length > args.limit ? { truncated: true } : {}),
@@ -440,9 +472,11 @@ export function monthReview(
   expand?: string,
 ) {
   const monthTxns = ledger.txns.filter((t) => t.month === month && t.status === "counted");
+  const cashback = ledger.cashbackByMonth.get(month) ?? 0;
   const live = {
-    spent: round2(monthTxns.filter((t) => t.kind === "expense").reduce((s, t) => s + t.net, 0)),
+    spent: afterCashback(monthTxns.filter((t) => t.kind === "expense").reduce((s, t) => s + t.net, 0), cashback),
     income: round2(monthTxns.filter((t) => t.kind === "income").reduce((s, t) => s + t.net, 0)),
+    ...(cashback ? { cashback } : {}),
   };
 
   if (!stored) {
@@ -749,7 +783,16 @@ export function overview(ledger: Ledger, today: string, reviewedMonths: string[]
     transactions: ledger.txns.length,
     months: [...months.entries()]
       .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-      .map(([month, v]) => ({ month, ...v, has_ai_review: reviewed.has(month) })),
+      .map(([month, v]) => {
+        const cashback = ledger.cashbackByMonth.get(month) ?? 0;
+        return {
+          month,
+          ...v,
+          spent: afterCashback(v.spent, cashback),
+          ...(cashback ? { cashback } : {}),
+          has_ai_review: reviewed.has(month),
+        };
+      }),
     categories: [...new Set(ledger.categories.map((c) => c.name))]
       .sort((a, b) => (usedCats.get(b) ?? 0) - (usedCats.get(a) ?? 0))
       .map((name) => ({ name, transactions: usedCats.get(name) ?? 0 })),

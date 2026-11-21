@@ -678,3 +678,40 @@ test("a cashback credit is never income, even with a stale is_income", () => {
   assert.equal(ledger.byId.get("cb")!.status, "not_counted");
   assert.equal(summary(ledger, { kind: "income" }).total, 50_000);
 });
+
+test("cashback lowers the month it names in every spending total, never a category", () => {
+  const ledger = ledgerOf([
+    txn("food", "2026-09-05", 3000),
+    txn("trip", "2026-09-20", 2000, { category_id: TRAVEL }),
+    txn("oct", "2026-10-02", 500),
+    credit("cb", "2026-10-03", 1246, { cashback_month: "2026-09-01" }),
+    credit("cb-dup", "2026-10-03", 1246, { cashback_month: "2026-09-01" }),
+  ], { duplicateIds: ["cb-dup"] });
+  const sep = { from: "2026-09-01", to: "2026-09-30" };
+
+  const total = summary(ledger, { period: sep });
+  assert.equal(total.total, 3754);
+  assert.equal(total.before_cashback, 5000);
+  assert.equal(total.cashback, 1246);
+
+  const byCategory = summary(ledger, { period: sep, group_by: "category" });
+  assert.deepEqual(byCategory.rows.map((r) => r.total), [3000, 2000]);
+  assert.deepEqual(byCategory.rows.map((r) => r.share_pct), [60, 40]);
+
+  const byMonth = summary(ledger, { group_by: "month", period: { from: "2026-09-01", to: "2026-10-31" } });
+  assert.deepEqual(byMonth.rows.map((r) => [r.total, r.cashback]), [[3754, 1246], [500, undefined]]);
+
+  assert.equal(summary(ledger, { period: sep, filter: { category: "Food & Dining" } }).total, 3000);
+  assert.equal(summary(ledger, { period: { from: "2026-09-02", to: "2026-09-30" } }).total, 5000);
+  assert.equal(search(ledger, { period: sep }).spent_total, 3754);
+  assert.equal(monthReview(ledger, "2026-09", null, []).live_totals.spent, 3754);
+  assert.equal(overview(ledger, "2026-10-13", [], 0, 0).months[0].spent, 3754);
+});
+
+test("a cashback larger than the month's spending floors the total at zero", () => {
+  const ledger = ledgerOf([
+    txn("food", "2026-09-05", 100),
+    credit("cb", "2026-10-03", 1246, { cashback_month: "2026-09-01" }),
+  ]);
+  assert.equal(summary(ledger, { period: { from: "2026-09-01", to: "2026-09-30" } }).total, 0);
+});

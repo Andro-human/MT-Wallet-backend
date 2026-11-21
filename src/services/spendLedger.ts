@@ -94,6 +94,8 @@ export interface Ledger {
   /** Linked refund money per original transaction. A loan's repayments are
    *  linked the same way, so this is also what has come back on a loan. */
   refundTotals: Map<string, number>;
+  /** Cashback keyed "YYYY-MM" by the month it lowers, not the month it arrived. */
+  cashbackByMonth: Map<string, number>;
   categories: LedgerInputs["categories"];
   groups: LedgerInputs["groups"];
   subscriptionLinks: SubscriptionLinkRow[];
@@ -139,6 +141,13 @@ export function resolveLedger(input: LedgerInputs): Ledger {
   }
 
   const unique = new Map(input.txns.map((t) => [t.id, t]));
+
+  const cashbackByMonth = new Map<string, number>();
+  for (const t of unique.values()) {
+    if (!t.cashback_month || t.direction !== "credit" || duplicates.has(t.id)) continue;
+    const month = t.cashback_month.slice(0, 7);
+    cashbackByMonth.set(month, round2((cashbackByMonth.get(month) ?? 0) + Number(t.amount)));
+  }
 
   const txns: LedgerTxn[] = [...unique.values()].map((t) => {
     const amount = Number(t.amount);
@@ -191,6 +200,7 @@ export function resolveLedger(input: LedgerInputs): Ledger {
     txns,
     byId: new Map(txns.map((t) => [t.id, t])),
     refundTotals,
+    cashbackByMonth,
     categories: input.categories,
     groups: input.groups,
     subscriptionLinks: subscriptionLinks.map(({ label: _label, ...link }) => link),
